@@ -183,15 +183,21 @@ fn render_column(
         wip_text,
     ]);
 
-    let border_color = if is_focused {
-        Theme::COLUMN_FOCUSED_BORDER
+    // Both borders keep the terminal foreground; the focused one gains weight
+    // and the unfocused one recedes, rather than either claiming a palette slot.
+    let border_style = if is_focused {
+        Style::default()
+            .fg(Theme::COLUMN_FOCUSED_BORDER)
+            .add_modifier(focused_mod)
     } else {
-        Theme::COLUMN_BORDER
+        Style::default()
+            .fg(Theme::COLUMN_BORDER)
+            .add_modifier(Modifier::DIM)
     };
 
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border_color).add_modifier(focused_mod))
+        .border_style(border_style)
         .border_type(BorderType::Rounded)
         .title(header_line)
         .padding(Padding::new(1, 1, 0, 0));
@@ -256,9 +262,9 @@ fn render_column(
         let track = if col.hidden { "╎" } else { " " };
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .track_symbol(Some(track))
-            .track_style(Style::default().fg(border_color))
+            .track_style(border_style)
             .thumb_symbol("▐")
-            .thumb_style(Style::default().fg(border_color))
+            .thumb_style(border_style)
             .begin_symbol(None)
             .end_symbol(None);
         let mut scrollbar_state = ScrollbarState::new(cards.len())

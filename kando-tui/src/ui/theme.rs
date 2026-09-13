@@ -1,4 +1,4 @@
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 
 use kando_core::board::Priority;
 
@@ -74,12 +74,16 @@ pub struct Theme;
 impl Theme {
     // Base: everything defaults to the terminal's own foreground
     pub const FG: Color = Color::Reset;
-    pub const DIM: Color = Color::DarkGray;
+    /// Secondary text keeps the terminal's own foreground and recedes with
+    /// `Modifier::DIM` instead of claiming the DarkGray palette slot, which
+    /// users theme arbitrarily and which is near-invisible on some schemes.
+    pub const DIM: Color = Color::Reset;
 
     // Column
     pub const COLUMN_HEADER: Color = Color::Reset;
-    /// Unfocused column borders recede to DarkGray.
-    pub const COLUMN_BORDER: Color = Color::DarkGray;
+    /// Unfocused column borders keep the terminal foreground and recede via
+    /// `Modifier::DIM`, applied where the border style is built.
+    pub const COLUMN_BORDER: Color = Color::Reset;
     /// Focused column border uses the terminal default fg; Modifier::BOLD
     /// in board_view carries the visual emphasis.
     pub const COLUMN_FOCUSED_BORDER: Color = Color::Reset;
@@ -120,7 +124,9 @@ impl Theme {
     pub const HINT_DESC: Color = Color::Reset;
 
     pub fn dim_style() -> Style {
-        Style::default().fg(Self::DIM)
+        Style::default()
+            .fg(Self::DIM)
+            .add_modifier(Modifier::DIM)
     }
 
     pub fn status_style() -> Style {
@@ -252,13 +258,37 @@ mod tests {
 
     #[test]
     fn column_border_is_dimmed() {
-        assert_eq!(Theme::COLUMN_BORDER, Color::DarkGray);
+        // Dimming is a modifier, not a palette slot: DarkGray is themed
+        // arbitrarily and disappears entirely on some schemes.
+        assert_eq!(Theme::COLUMN_BORDER, Color::Reset);
     }
 
     #[test]
-    fn dim_style_uses_dim_color() {
+    fn no_theme_colour_claims_a_dark_or_bright_slot() {
+        // VERY_STALE's LightRed and the tag PALETTE are deliberate and exempt:
+        // the first is a documented escalation step, the second needs twelve
+        // distinct values and the base six are not enough.
+        for (name, colour) in [
+            ("FG", Theme::FG),
+            ("DIM", Theme::DIM),
+            ("COLUMN_HEADER", Theme::COLUMN_HEADER),
+            ("COLUMN_BORDER", Theme::COLUMN_BORDER),
+            ("COLUMN_FOCUSED_BORDER", Theme::COLUMN_FOCUSED_BORDER),
+            ("CARD_BORDER", Theme::CARD_BORDER),
+            ("CARD_TITLE", Theme::CARD_TITLE),
+        ] {
+            assert!(
+                !matches!(colour, Color::DarkGray | Color::Gray | Color::Black),
+                "{name} claims a grey slot the user themes"
+            );
+        }
+    }
+
+    #[test]
+    fn dim_style_recedes_without_claiming_a_palette_slot() {
         let s = Theme::dim_style();
-        assert_eq!(s.fg, Some(Theme::DIM));
+        assert_eq!(s.fg, Some(Color::Reset));
+        assert!(s.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]
@@ -330,10 +360,22 @@ mod tests {
 
     #[test]
     fn semantic_content_colors_are_never_dim() {
-        // Anti-regression: titles, assignees, and tags must never be dimmed.
-        assert_ne!(Theme::CARD_TITLE, Theme::DIM);
-        assert_ne!(Theme::NEW_CARD_TITLE, Theme::DIM);
-        assert_ne!(Theme::ASSIGNEE, Theme::DIM);
+        // Anti-regression: titles, assignees and tags must never render dimmed.
+        // Dimness is a modifier now, not a palette slot, so compare whole
+        // styles: comparing the colour constants alone would pass happily while
+        // a title carried Modifier::DIM.
+        for (name, colour) in [
+            ("CARD_TITLE", Theme::CARD_TITLE),
+            ("NEW_CARD_TITLE", Theme::NEW_CARD_TITLE),
+            ("ASSIGNEE", Theme::ASSIGNEE),
+        ] {
+            let content = Style::default().fg(colour);
+            assert_ne!(content, Theme::dim_style(), "{name} renders as dim");
+            assert!(
+                !content.add_modifier.contains(Modifier::DIM),
+                "{name} is dimmed"
+            );
+        }
     }
 
     #[test]
