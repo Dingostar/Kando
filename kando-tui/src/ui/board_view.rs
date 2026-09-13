@@ -84,7 +84,7 @@ pub fn render_board(f: &mut Frame, area: Rect, board: &Board, state: &AppState, 
         .collect();
 
     if visible_columns.is_empty() {
-        let msg = Paragraph::new("No visible columns. Press z then h to show hidden columns.");
+        let msg = Paragraph::new("No visible columns. Press c then s to show hidden columns.");
         f.render_widget(msg, area);
         return;
     }
@@ -226,7 +226,11 @@ fn render_column(
     }
 
     // Render cards
-    let heights: Vec<u16> = cards.iter().map(|&(_, card)| card_height(card)).collect();
+    let heights: Vec<u16> = if state.compact {
+        vec![1; cards.len()]
+    } else {
+        cards.iter().map(|&(_, card)| card_height(card)).collect()
+    };
 
     // Calculate scroll offset (position within the filtered list, not unfiltered index)
     let selected_in_col = if is_focused {
@@ -242,14 +246,20 @@ fn render_column(
 
     let mut y = inner.y;
     for &(real_idx, card) in cards.iter().skip(scroll_offset) {
-        let height = card_height(card);
+        let height = if state.compact { 1 } else { card_height(card) };
         if y + height > inner.bottom() {
             break;
         }
         let card_area = Rect::new(inner.x, y, inner.width, height);
 
         let is_selected = is_focused && state.selected_card == real_idx;
-        render_card(f, card_area, card, is_selected, is_focused, policies, now, icons);
+        if state.compact {
+            render_compact_card(
+                f, card_area, card, is_selected, is_focused, policies, now, icons,
+            );
+        } else {
+            render_card(f, card_area, card, is_selected, is_focused, policies, now, icons);
+        }
         y += height;
     }
 
@@ -268,6 +278,110 @@ fn render_column(
         let scrollbar_area = area.inner(Margin { vertical: 1, horizontal: 0 });
         f.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
     }
+}
+
+/// Truncate to `width` display columns on grapheme boundaries, marking the cut
+/// with `…`. Slicing by bytes or chars would split a combining sequence or
+/// mis-measure a wide glyph.
+fn truncate_to_width(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let avail = width.saturating_sub(1); // room for the ellipsis
+    let truncated: String = text
+        .graphemes(true)
+        .scan(0, |used, g| {
+            let gw = g.width();
+            (*used + gw <= avail).then(|| {
+                *used += gw;
+                g
+            })
+        })
+        .collect();
+    format!("{truncated}…")
+}
+
+/// One row per card: the selection marker, the title, and the same glyph
+/// cluster a card carries, flushed right. No border, no id, no age — a compact
+/// board is for seeing how much is where, and the detail is one Enter away.
+#[allow(clippy::too_many_arguments)]
+fn render_compact_card(
+    f: &mut Frame,
+    area: Rect,
+    card: &Card,
+    is_selected: bool,
+    is_col_focused: bool,
+    policies: &kando_core::board::Policies,
+    now: chrono::DateTime<Utc>,
+    icons: &Icons,
+) {
+    if area.width < 4 || area.height == 0 {
+        return;
+    }
+    let stale = staleness(card, policies, now);
+    let is_overdue = card.is_overdue(now.date_naive());
+    let is_new = is_new_card(card.created, now);
+
+    let mut glyphs: Vec<(&str, Style)> = Vec::new();
+    match stale {
+        Staleness::Stale => glyphs.push((icons.stale, Style::default().fg(Theme::STALE))),
+        Staleness::VeryStale => {
+            glyphs.push((icons.very_stale, Style::default().fg(Theme::VERY_STALE)))
+        }
+        Staleness::Fresh => {}
+    }
+    if let Some(sym) = icons.priority(card.priority) {
+        glyphs.push((sym, Style::default().fg(Theme::priority_color(card.priority))));
+    }
+    if is_overdue {
+        glyphs.push((icons.overdue, Style::default().fg(Theme::OVERDUE)));
+    }
+    if card.is_blocked() {
+        glyphs.push((icons.blocker, Style::default().fg(Theme::BLOCKER)));
+    }
+
+    let marker = if is_selected {
+        format!("{} ", icons.chevron)
+    } else {
+        "  ".to_string()
+    };
+    let glyph_width: usize = glyphs
+        .iter()
+        .map(|(t, _)| t.width())
+        .sum::<usize>()
+        + glyphs.len().saturating_sub(1);
+    let title_width = (area.width as usize)
+        .saturating_sub(marker.width() + glyph_width + 1)
+        .max(1);
+
+    let title_style = Style::default()
+        .fg(if is_new {
+            Theme::NEW_CARD_TITLE
+        } else {
+            Theme::CARD_TITLE
+        })
+        .add_modifier(if is_selected {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        });
+
+    let title = truncate_to_width(&card.title, title_width);
+    let mut spans = vec![
+        Span::styled(marker, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(title.clone(), title_style),
+    ];
+    let used = spans.iter().map(|s| s.width()).sum::<usize>();
+    let pad = (area.width as usize).saturating_sub(used + glyph_width);
+    spans.push(Span::raw(" ".repeat(pad)));
+    for (i, (text, style)) in glyphs.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(text, style));
+    }
+    let _ = is_col_focused;
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// A card is two border rows, an id line and a title line, plus a metadata row
@@ -422,26 +536,11 @@ fn render_card(
     ];
     line1_spans.extend(right_glyphs);
 
-    // Line 2: title (unicode-safe truncation using grapheme clusters)
-    let max_title_width = inner.width as usize;
-    let title_display_width = card.title.width() + 2; // 2 for leading spaces
-    let title = if title_display_width > max_title_width {
-        let avail = max_title_width.saturating_sub(3); // 2 spaces + 1 for '…'
-        let truncated: String = card
-            .title
-            .graphemes(true)
-            .scan(0, |w, g| {
-                let gw = g.width();
-                (*w + gw <= avail).then(|| {
-                    *w += gw;
-                    g
-                })
-            })
-            .collect();
-        format!("  {truncated}…")
-    } else {
-        format!("  {}", card.title)
-    };
+    // Line 2: title, indented by two, unicode-safe
+    let title = format!(
+        "  {}",
+        truncate_to_width(&card.title, (inner.width as usize).saturating_sub(2))
+    );
     let title_line = Line::from(Span::styled(
         title,
         Style::default()
@@ -784,5 +883,33 @@ mod tests {
         // Never reports zero: a viewport too small for one card still shows it,
         // clipped, rather than rendering an empty column.
         assert_eq!(visible_count(&heights, 0, 1), 1);
+    }
+
+    #[test]
+    fn truncation_respects_graphemes_and_display_width() {
+        assert_eq!(truncate_to_width("short", 10), "short");
+        assert_eq!(truncate_to_width("exactly-ten", 11), "exactly-ten");
+        // A wide glyph counts as two columns, not one char.
+        assert_eq!(truncate_to_width("日本語", 4).width(), 3);
+        // A combining sequence is never split down the middle.
+        let combined = "e\u{301}e\u{301}e\u{301}";
+        let cut = truncate_to_width(combined, 2);
+        assert!(cut.ends_with('…'));
+        assert!(cut.width() <= 2);
+        // Degenerate widths must not panic.
+        assert!(truncate_to_width("anything", 0).width() <= 1);
+    }
+
+    #[test]
+    fn compact_rows_are_one_line_each() {
+        // The whole point: height stops depending on the card's contents.
+        let mut card = Card::new("0001".to_string(), "Tagged".to_string());
+        card.tags.push("infra".to_string());
+        assert_eq!(card_height(&card), 5);
+        // Compact overrides that in render_column; the heights it lays out are
+        // uniform, so a column fits as many cards as it has rows.
+        let heights = vec![1u16; 5];
+        assert_eq!(visible_count(&heights, 0, 5), 5);
+        assert_eq!(scroll_offset_for(&heights, 4, 3), 2);
     }
 }

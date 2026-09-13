@@ -60,6 +60,8 @@ fn map_normal(key: KeyEvent) -> Action {
         KeyCode::Char(' ') => Action::EnterSpaceMode,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
         KeyCode::Char('c') => Action::EnterColumnMode,
+        // `z` is vim's fold namespace, and compact view folds a card to one row.
+        KeyCode::Char('z') => Action::ToggleCompactView,
         KeyCode::Char('u') => Action::Undo,
         KeyCode::Char('m') => Action::ShowMetrics,
         KeyCode::Char('r') => Action::ReloadBoard,
@@ -495,6 +497,10 @@ mod tests {
     #[test]
     fn normal_c_enters_column_mode() {
         assert_eq!(map_key(key(KeyCode::Char('c')), &Mode::Normal), Action::EnterColumnMode);
+        assert_eq!(
+            map_key(key(KeyCode::Char('z')), &Mode::Normal),
+            Action::ToggleCompactView
+        );
     }
 
     #[test]

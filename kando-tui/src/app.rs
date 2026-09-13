@@ -298,6 +298,8 @@ pub struct AppState {
     pub focused_column: usize,
     pub selected_card: usize,
     pub show_hidden_columns: bool,
+    /// One row per card instead of a bordered card.
+    pub compact: bool,
     pub active_filter: Option<String>,
     pub active_tag_filters: Vec<String>,
     pub active_assignee_filters: Vec<String>,
@@ -342,6 +344,7 @@ impl AppState {
             focused_column: 0,
             selected_card: 0,
             show_hidden_columns: false,
+            compact: false,
             active_filter: None,
             active_tag_filters: Vec::new(),
             active_assignee_filters: Vec::new(),
@@ -1019,6 +1022,9 @@ fn process_action(
         // Visibility toggles
         Action::ToggleHiddenColumns => {
             handle_visibility_toggle(board, state, action);
+        }
+        Action::ToggleCompactView => {
+            state.compact = !state.compact;
         }
 
         // Column mode actions

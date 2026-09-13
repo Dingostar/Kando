@@ -1,6 +1,9 @@
 /// All possible semantic actions in Kando.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
+    /// Collapse cards to one row each, and back.
+    ToggleCompactView,
+
     // Navigation
     FocusPrevColumn,
     FocusNextColumn,
