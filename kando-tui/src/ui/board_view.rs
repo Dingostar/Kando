@@ -215,11 +215,13 @@ fn render_column(
             Rect::new(area.x, area.y + 1, area.width, 1),
         );
     }
-    if area.height < 4 {
+    if area.height < 3 {
         return;
     }
-    // One blank row separates the rule from the first card.
-    let inner = Rect::new(area.x, area.y + 3, area.width, area.height - 3);
+    // Cards start immediately under the rule. A blank row here looked calmer but
+    // cost a row in every column, and the box this replaced spent only one row
+    // on chrome by using its top border as the heading.
+    let inner = Rect::new(area.x, area.y + 2, area.width, area.height - 2);
 
     if inner.height == 0 || inner.width == 0 {
         return;
