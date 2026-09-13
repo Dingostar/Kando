@@ -4,9 +4,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
-use ratatui::symbols::border;
 use ratatui::widgets::{
-    Block, BorderType, Borders, Padding, Paragraph, Scrollbar, ScrollbarOrientation,
+    Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState,
 };
 use ratatui::Frame;
@@ -71,6 +70,9 @@ pub(crate) fn is_new_card(created: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     created.date_naive() == now.date_naive()
 }
 
+/// Blank columns between adjacent board columns.
+const COLUMN_GAP: u16 = 2;
+
 pub fn render_board(f: &mut Frame, area: Rect, board: &Board, state: &AppState, now: DateTime<Utc>) {
 
     // Filter visible columns
@@ -92,8 +94,11 @@ pub fn render_board(f: &mut Frame, area: Rect, board: &Board, state: &AppState, 
         .iter()
         .map(|_| Constraint::Ratio(1, visible_columns.len() as u32))
         .collect();
+    // Columns no longer carry side borders, so the gap between them is what
+    // separates one column's cards from the next.
     let col_areas = Layout::default()
         .direction(Direction::Horizontal)
+        .spacing(COLUMN_GAP)
         .constraints(constraints)
         .split(area);
 
@@ -195,28 +200,26 @@ fn render_column(
             .add_modifier(Modifier::DIM)
     };
 
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .border_type(BorderType::Rounded)
-        .title(header_line)
-        .padding(Padding::new(1, 1, 0, 0));
-
-    if col.hidden {
-        block = block.border_set(border::Set {
-            top_left: "╭",
-            top_right: "╮",
-            bottom_left: "╰",
-            bottom_right: "╯",
-            vertical_left: "╎",
-            vertical_right: "╎",
-            horizontal_top: "╌",
-            horizontal_bottom: "╌",
-        });
+    // A heading and a rule, not a box. Cards already carry borders, so wrapping
+    // them in another one put four vertical rules between adjacent cards and
+    // spent two columns per column on chrome.
+    if area.height == 0 || area.width == 0 {
+        return;
     }
-
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    f.render_widget(header_line, Rect::new(area.x, area.y, area.width, 1));
+    if area.height >= 2 {
+        // A hidden column keeps its dashed treatment, now on the rule.
+        let rule = if col.hidden { "╌" } else { "─" };
+        f.render_widget(
+            Line::styled(rule.repeat(area.width as usize), border_style),
+            Rect::new(area.x, area.y + 1, area.width, 1),
+        );
+    }
+    if area.height < 4 {
+        return;
+    }
+    // One blank row separates the rule from the first card.
+    let inner = Rect::new(area.x, area.y + 3, area.width, area.height - 3);
 
     if inner.height == 0 || inner.width == 0 {
         return;
