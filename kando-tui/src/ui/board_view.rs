@@ -1,5 +1,5 @@
 use fuzzy_matcher::skim::SkimMatcherV2;
-use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
@@ -72,6 +72,10 @@ pub(crate) fn is_new_card(created: DateTime<Utc>, now: DateTime<Utc>) -> bool {
 
 /// Blank columns between adjacent board columns.
 const COLUMN_GAP: u16 = 2;
+
+/// Columns kept clear at a column's right edge when it scrolls: one for the
+/// bar, one so it does not touch the card.
+const SCROLLBAR_RESERVE: u16 = 2;
 
 pub fn render_board(f: &mut Frame, area: Rect, board: &Board, state: &AppState, now: DateTime<Utc>) {
 
@@ -246,13 +250,22 @@ fn render_column(
     let scroll_offset = scroll_offset_for(&heights, selected_in_col, inner.height);
     let max_visible = visible_count(&heights, scroll_offset, inner.height);
 
+    // A scrollbar needs its own column and a gap, or it draws straight onto the
+    // card border beside it.
+    let scrolling = cards.len() > max_visible;
+    let card_width = if scrolling && inner.width > SCROLLBAR_RESERVE {
+        inner.width - SCROLLBAR_RESERVE
+    } else {
+        inner.width
+    };
+
     let mut y = inner.y;
     for &(real_idx, card) in cards.iter().skip(scroll_offset) {
         let height = if state.compact { 1 } else { card_height(card) };
         if y + height > inner.bottom() {
             break;
         }
-        let card_area = Rect::new(inner.x, y, inner.width, height);
+        let card_area = Rect::new(inner.x, y, card_width, height);
 
         let is_selected = is_focused && state.selected_card == real_idx;
         if state.compact {
@@ -266,7 +279,7 @@ fn render_column(
     }
 
     // Scroll indicator
-    if cards.len() > max_visible {
+    if scrolling {
         let track = if col.hidden { "╎" } else { " " };
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .track_symbol(Some(track))
@@ -277,7 +290,7 @@ fn render_column(
             .end_symbol(None);
         let mut scrollbar_state = ScrollbarState::new(cards.len())
             .position(selected_in_col);
-        let scrollbar_area = area.inner(Margin { vertical: 1, horizontal: 0 });
+        let scrollbar_area = inner;
         f.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
     }
 }
@@ -913,5 +926,28 @@ mod tests {
         let heights = vec![1u16; 5];
         assert_eq!(visible_count(&heights, 0, 5), 5);
         assert_eq!(scroll_offset_for(&heights, 4, 3), 2);
+    }
+
+    #[test]
+    fn a_scrolling_column_keeps_the_bar_off_the_card_border() {
+        // The column box used to absorb the scrollbar; without it the bar landed
+        // on the card's own right border and ate it.
+        let width = 40u16;
+        let scrolling_width = width - SCROLLBAR_RESERVE;
+        assert!(scrolling_width < width, "no column reserved for the bar");
+        assert_eq!(
+            width - scrolling_width,
+            2,
+            "one column for the bar, one so it does not touch the card"
+        );
+        // A column too narrow to reserve anything must not underflow.
+        for narrow in 0..=SCROLLBAR_RESERVE {
+            let card = if narrow > SCROLLBAR_RESERVE {
+                narrow - SCROLLBAR_RESERVE
+            } else {
+                narrow
+            };
+            assert!(card <= narrow);
+        }
     }
 }
