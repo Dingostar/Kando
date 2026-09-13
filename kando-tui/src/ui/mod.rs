@@ -52,9 +52,25 @@ pub fn render_overlay_frame(
         .title(title)
         .padding(Padding::new(2, 2, 1, 1));
     let inner = block.inner(area);
-    f.render_widget(Clear, area);
+    // Clear a cell beyond the frame as well, so board cards never sit flush
+    // against the panel border and read as part of it.
+    f.render_widget(Clear, with_margin(area, f.area()));
     f.render_widget(block, area);
     inner
+}
+
+/// `area` grown by one cell on every side, clipped to `bounds`.
+fn with_margin(area: Rect, bounds: Rect) -> Rect {
+    let left = area.x.saturating_sub(1).max(bounds.x);
+    let top = area.y.saturating_sub(1).max(bounds.y);
+    let right = area.right().saturating_add(1).min(bounds.right());
+    let bottom = area.bottom().saturating_add(1).min(bounds.bottom());
+    Rect::new(
+        left,
+        top,
+        right.saturating_sub(left),
+        bottom.saturating_sub(top),
+    )
 }
 
 pub fn render(f: &mut Frame, board: &Board, state: &mut AppState, now: DateTime<Utc>, kando_dir: &std::path::Path) {
@@ -183,5 +199,19 @@ mod tests {
         let r = overlay_rect(area);
         assert_eq!(r.width, 50); // min 60 clamped to area width 50
         assert_eq!(r.height, 20); // min 24 clamped to area height 20
+    }
+
+    #[test]
+    fn overlay_margin_grows_by_one_and_clips_to_the_screen() {
+        let screen = Rect::new(0, 0, 100, 40);
+        let panel = Rect::new(10, 5, 30, 10);
+        let ringed = with_margin(panel, screen);
+        assert_eq!((ringed.x, ringed.y), (9, 4));
+        assert_eq!((ringed.right(), ringed.bottom()), (41, 16));
+
+        // A panel flush against the edges must not grow outside the screen.
+        let flush = Rect::new(0, 0, 100, 40);
+        let ringed = with_margin(flush, screen);
+        assert_eq!(ringed, screen);
     }
 }

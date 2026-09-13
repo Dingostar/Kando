@@ -236,6 +236,7 @@ pub const NORMAL_BINDINGS: &[Binding] = &[
     Binding { key: "Enter", description: "Open card detail" },
     Binding { key: "/", description: "Search cards" },
     Binding { key: "s", description: "Sort column" },
+    Binding { key: "z", description: "Compact view" },
     Binding { key: "m", description: "Board metrics" },
     Binding { key: "r", description: "Reload board" },
     Binding { key: "u", description: "Undo last delete" },
