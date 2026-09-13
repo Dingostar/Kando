@@ -2,7 +2,7 @@ use ratatui::layout::{Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
     Wrap,
 };
 use ratatui::Frame;
@@ -17,27 +17,16 @@ pub fn render_card_detail(f: &mut Frame, area: Rect, card: &Card, policies: &Pol
 
     let panel_area = super::overlay_rect(area);
 
-    // Clear background
-    f.render_widget(Clear, panel_area);
 
     let stale = staleness(card, policies, now);
     let is_overdue = card.is_overdue(now.date_naive());
     let border_color = card_border_color(card.is_blocked(), is_overdue, true, stale, false);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
-        .title(Span::styled(
-            format!(" {} ", card.id),
-            Style::default()
-                .fg(Theme::FG)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .padding(Padding::new(2, 2, 1, 1));
-
-    let inner = block.inner(panel_area);
-    f.render_widget(block, panel_area);
+    let title = Line::from(Span::styled(
+        format!(" {} ", card.id),
+        Style::default().fg(Theme::FG).add_modifier(Modifier::BOLD),
+    ));
+    let inner = super::render_overlay_frame(f, panel_area, title, border_color);
 
     if inner.height == 0 {
         return;

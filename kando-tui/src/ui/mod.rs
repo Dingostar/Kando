@@ -35,6 +35,28 @@ pub fn centered_rect(area: Rect, w_pct: u16, h_pct: u16, min_w: u16, min_h: u16)
     Rect::new(x, y, width, height)
 }
 
+/// Clear an overlay's area, draw its frame, and hand back the inner rect to
+/// write into. The border style, corner type and padding live here so the
+/// overlays cannot drift apart from each other.
+pub fn render_overlay_frame(
+    f: &mut Frame,
+    area: Rect,
+    title: ratatui::text::Line<'_>,
+    border_color: ratatui::style::Color,
+) -> Rect {
+    use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding};
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(ratatui::style::Style::default().fg(border_color))
+        .title(title)
+        .padding(Padding::new(2, 2, 1, 1));
+    let inner = block.inner(area);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    inner
+}
+
 pub fn render(f: &mut Frame, board: &Board, state: &mut AppState, now: DateTime<Utc>, kando_dir: &std::path::Path) {
     let area = f.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
