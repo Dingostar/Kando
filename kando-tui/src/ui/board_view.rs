@@ -223,8 +223,7 @@ fn render_column(
     }
 
     // Render cards
-    let card_height: u16 = 5; // 3 inner lines + 2 border lines
-    let max_visible = (inner.height / card_height) as usize;
+    let heights: Vec<u16> = cards.iter().map(|&(_, card)| card_height(card)).collect();
 
     // Calculate scroll offset (position within the filtered list, not unfiltered index)
     let selected_in_col = if is_focused {
@@ -235,26 +234,20 @@ fn render_column(
     } else {
         0
     };
-    let scroll_offset = if cards.len() > max_visible {
-        if selected_in_col >= max_visible {
-            selected_in_col - max_visible + 1
-        } else {
-            0
-        }
-    } else {
-        0
-    };
+    let scroll_offset = scroll_offset_for(&heights, selected_in_col, inner.height);
+    let max_visible = visible_count(&heights, scroll_offset, inner.height);
 
-    for (vis_idx, &(real_idx, card)) in cards.iter().enumerate().skip(scroll_offset) {
-        if vis_idx - scroll_offset >= max_visible {
+    let mut y = inner.y;
+    for &(real_idx, card) in cards.iter().skip(scroll_offset) {
+        let height = card_height(card);
+        if y + height > inner.bottom() {
             break;
         }
-
-        let y = inner.y + ((vis_idx - scroll_offset) as u16 * card_height);
-        let card_area = Rect::new(inner.x, y, inner.width, card_height);
+        let card_area = Rect::new(inner.x, y, inner.width, height);
 
         let is_selected = is_focused && state.selected_card == real_idx;
         render_card(f, card_area, card, is_selected, is_focused, policies, now, icons);
+        y += height;
     }
 
     // Scroll indicator
@@ -272,6 +265,50 @@ fn render_column(
         let scrollbar_area = area.inner(Margin { vertical: 1, horizontal: 0 });
         f.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
     }
+}
+
+/// A card is two border rows, an id line and a title line, plus a metadata row
+/// only when there are assignees or tags to put in it. Blank rows on cards that
+/// have neither were costing a row each.
+///
+/// This makes cards of differing heights, so rows no longer line up across
+/// columns. That is a real cost on a board whose premise is comparing columns,
+/// paid to stop showing an empty line on every bare card.
+pub(crate) fn card_height(card: &Card) -> u16 {
+    let has_metadata = !card.assignees.is_empty() || !card.tags.is_empty();
+    if has_metadata { 5 } else { 4 }
+}
+
+/// Smallest offset that still fits the selected card in `viewport`.
+pub(crate) fn scroll_offset_for(heights: &[u16], selected: usize, viewport: u16) -> usize {
+    if heights.is_empty() {
+        return 0;
+    }
+    let mut start = selected.min(heights.len() - 1);
+    let mut used = u32::from(heights[start]);
+    while start > 0 {
+        let next = used + u32::from(heights[start - 1]);
+        if next > u32::from(viewport) {
+            break;
+        }
+        used = next;
+        start -= 1;
+    }
+    start
+}
+
+/// How many cards fit from `offset` onward, for the scroll indicator.
+pub(crate) fn visible_count(heights: &[u16], offset: usize, viewport: u16) -> usize {
+    let mut used = 0u32;
+    let mut count = 0;
+    for height in heights.iter().skip(offset) {
+        used += u32::from(*height);
+        if used > u32::from(viewport) {
+            break;
+        }
+        count += 1;
+    }
+    count.max(1)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -705,5 +742,44 @@ mod tests {
         let before_midnight = day.and_hms_opt(23, 59, 59).unwrap().and_utc();
         let after_midnight = day.succ_opt().unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc();
         assert!(!is_new_card(before_midnight, after_midnight));
+    }
+
+    #[test]
+    fn card_height_drops_the_metadata_row_when_there_is_none() {
+        let bare = Card::new("0001".to_string(), "Bare".to_string());
+        assert_eq!(card_height(&bare), 4);
+
+        let mut tagged = Card::new("0002".to_string(), "Tagged".to_string());
+        tagged.tags.push("infra".to_string());
+        assert_eq!(card_height(&tagged), 5);
+
+        let mut assigned = Card::new("0003".to_string(), "Assigned".to_string());
+        assigned.assignees.push("krfl".to_string());
+        assert_eq!(card_height(&assigned), 5);
+    }
+
+    #[test]
+    fn scrolling_keeps_the_selected_card_visible_at_mixed_heights() {
+        let heights = [4, 5, 4, 5];
+        // Everything fits: no scrolling.
+        assert_eq!(scroll_offset_for(&heights, 3, 18), 0);
+        // One row short of fitting all four, so the first scrolls away.
+        assert_eq!(scroll_offset_for(&heights, 3, 17), 1);
+        // Only the selected card fits.
+        assert_eq!(scroll_offset_for(&heights, 3, 5), 3);
+        // A stale selection index must not panic or run past the end.
+        assert_eq!(scroll_offset_for(&heights, usize::MAX, 9), 2);
+        assert_eq!(scroll_offset_for(&[], 0, 10), 0);
+    }
+
+    #[test]
+    fn visible_count_measures_rows_not_cards() {
+        let heights = [4, 5, 4];
+        assert_eq!(visible_count(&heights, 0, 13), 3);
+        assert_eq!(visible_count(&heights, 0, 9), 2);
+        assert_eq!(visible_count(&heights, 0, 4), 1);
+        // Never reports zero: a viewport too small for one card still shows it,
+        // clipped, rather than rendering an empty column.
+        assert_eq!(visible_count(&heights, 0, 1), 1);
     }
 }
