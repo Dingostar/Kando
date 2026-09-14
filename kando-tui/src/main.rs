@@ -2523,7 +2523,7 @@ fn cmd_col_remove(cwd: &Path, column: &str, move_to: Option<&str>, json: bool) -
             // Extract all cards, then push to target. We intentionally skip
             // card.touch() here: the user is destroying a column, not editing
             // cards; preserving the original updated timestamp is correct.
-            let cards: Vec<_> = board.columns[col_idx].cards.drain(..).collect();
+            let cards = std::mem::take(&mut board.columns[col_idx].cards);
             let moved = cards.len();
             board.columns[target_idx].cards.extend(cards);
             board.columns[target_idx].sort_cards();
