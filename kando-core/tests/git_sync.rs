@@ -17,7 +17,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use kando_core::board::sync::{
-    commit_and_push, init_shadow, pull, shadow_dir_for, SyncStatus,
+    commit_and_push, commit_and_push_shadow, init_shadow, init_shadow_for_gitsync, pull,
+    pull_shadow, shadow_dir_for, SyncStatus,
 };
 
 /// Run git, and panic with its stderr when it fails.
@@ -301,6 +302,125 @@ fn committing_nothing_is_not_an_error() {
         before,
         "an empty commit was made anyway"
     );
+}
+
+#[test]
+fn a_failed_push_is_reported_as_a_failure() {
+    // The asymmetry that makes this the important one: a failed pull costs you
+    // cards you have not received yet, and you find out next time. A failed push
+    // reported as success costs you work you believe is already safe.
+    let f = fixture("kando", true);
+    let (mut state, _guard) = shadow_for(&f, "kando");
+
+    write_card(&f.kando_dir(), "backlog", "2", "Unsaved work");
+    std::fs::remove_dir_all(&f.remote).unwrap();
+    commit_and_push(&mut state, &f.kando_dir(), "add card 2");
+
+    assert!(
+        !state.online,
+        "a push to a remote that is gone reported success"
+    );
+    assert!(
+        state.last_error.is_some(),
+        "push failed with nothing to tell the user"
+    );
+    // The card must still be on disk: the user's work outlives the failed sync.
+    assert!(card_path(&f.work, "backlog", "2").exists());
+}
+
+// ── GitSync mode ──────────────────────────────────────────────────────────────
+//
+// The second board mode, where the shadow clone is the board rather than a
+// staging copy of one, so nothing is copied back to a working directory. It is
+// live in storage.rs, app.rs and main.rs, and had no test of its own.
+
+/// A shadow for a GitSync board, which needs no local `.kando/` of its own.
+fn gitsync_shadow_for(
+    fixture: &Fixture,
+    branch: &str,
+) -> (kando_core::board::sync::SyncState, ShadowGuard) {
+    let state = init_shadow_for_gitsync(&fixture.work, branch).expect("init_shadow_for_gitsync");
+    let guard = ShadowGuard(state.shadow_path.clone());
+    set_identity(&state.shadow_path);
+    (state, guard)
+}
+
+#[test]
+fn a_gitsync_shadow_lands_on_the_requested_branch() {
+    let f = fixture("kando", true);
+    let (state, _guard) = gitsync_shadow_for(&f, "kando");
+
+    assert_eq!(
+        git(&state.shadow_path, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "kando"
+    );
+    assert!(state.shadow_path.join(".kando/columns/backlog/1.md").exists());
+}
+
+#[test]
+fn a_card_written_in_a_gitsync_shadow_reaches_the_remote() {
+    let f = fixture("kando", true);
+    let (mut state, _guard) = gitsync_shadow_for(&f, "kando");
+
+    // In this mode the shadow is the board, so the card is written there.
+    write_card(&state.shadow_path.join(".kando"), "backlog", "2", "Second card");
+    commit_and_push_shadow(&mut state, "add card 2");
+
+    assert!(state.online, "push failed: {:?}", state.last_error);
+    let fresh = f.clone_as("fresh");
+    git(&fresh, &["checkout", "kando"]);
+    assert!(
+        card_path(&fresh, "backlog", "2").exists(),
+        "card 2 never reached the remote from the gitsync shadow"
+    );
+}
+
+#[test]
+fn a_gitsync_pull_receives_a_teammates_card() {
+    let f = fixture("kando", true);
+    let (mut state, _guard) = gitsync_shadow_for(&f, "kando");
+
+    let mate = f.clone_as("mate");
+    git(&mate, &["checkout", "kando"]);
+    write_card(&mate.join(".kando"), "backlog", "7", "From a teammate");
+    git(&mate, &["add", "-A"]);
+    git(&mate, &["commit", "-m", "add card 7"]);
+    git(&mate, &["push", "origin", "kando"]);
+
+    assert_eq!(pull_shadow(&mut state), SyncStatus::Updated);
+    assert!(
+        state.shadow_path.join(".kando/columns/backlog/7.md").exists(),
+        "pull_shadow reported Updated but the card is not in the shadow"
+    );
+}
+
+#[test]
+fn a_failed_gitsync_push_is_reported_as_a_failure() {
+    // The same data-safety path as commit_and_push, and the worse of the two:
+    // here the shadow is the only copy, with no working directory behind it.
+    let f = fixture("kando", true);
+    let (mut state, _guard) = gitsync_shadow_for(&f, "kando");
+
+    write_card(&state.shadow_path.join(".kando"), "backlog", "2", "Unsaved work");
+    std::fs::remove_dir_all(&f.remote).unwrap();
+    commit_and_push_shadow(&mut state, "add card 2");
+
+    assert!(!state.online, "a push to a remote that is gone reported success");
+    assert!(state.last_error.is_some(), "push failed with nothing to tell the user");
+    assert!(state.shadow_path.join(".kando/columns/backlog/2.md").exists());
+}
+
+#[test]
+fn a_gitsync_pull_from_an_unreachable_remote_reports_offline() {
+    let f = fixture("kando", true);
+    let (mut state, _guard) = gitsync_shadow_for(&f, "kando");
+
+    std::fs::remove_dir_all(&f.remote).unwrap();
+
+    assert_eq!(pull_shadow(&mut state), SyncStatus::Offline);
+    assert!(!state.online);
+    assert!(state.last_error.is_some());
+    assert!(state.shadow_path.join(".kando/columns/backlog/1.md").exists());
 }
 
 #[test]
