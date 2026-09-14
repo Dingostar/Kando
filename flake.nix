@@ -35,7 +35,11 @@
 
       mkCraneLib = pkgs:
         let
-          toolchain = pkgs.rust-bin.stable.latest.minimal;
+          # `minimal` omits clippy, which made the kando-clippy check fail with
+          # "no such command: clippy" rather than ever linting anything.
+          toolchain = pkgs.rust-bin.stable.latest.minimal.override {
+            extensions = [ "clippy" ];
+          };
         in
         (crane.mkLib pkgs).overrideToolchain toolchain;
     in
@@ -50,6 +54,13 @@
             pname = "kando";
             strictDeps = true;
             nativeCheckInputs = [ pkgs.git ];
+            # The git sync tests clone into the user cache directory, which
+            # dirs::cache_dir() resolves under $HOME. The sandbox's default home
+            # is read-only, so give them a writable one.
+            preCheck = ''
+              export HOME="$TMPDIR/home"
+              mkdir -p "$HOME"
+            '';
           };
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
           kando = craneLib.buildPackage (commonArgs // {
@@ -78,6 +89,13 @@
             pname = "kando";
             strictDeps = true;
             nativeCheckInputs = [ pkgs.git ];
+            # The git sync tests clone into the user cache directory, which
+            # dirs::cache_dir() resolves under $HOME. The sandbox's default home
+            # is read-only, so give them a writable one.
+            preCheck = ''
+              export HOME="$TMPDIR/home"
+              mkdir -p "$HOME"
+            '';
           };
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
         in
