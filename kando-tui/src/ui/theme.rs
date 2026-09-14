@@ -74,10 +74,6 @@ pub struct Theme;
 impl Theme {
     // Base: everything defaults to the terminal's own foreground
     pub const FG: Color = Color::Reset;
-    /// Secondary text keeps the terminal's own foreground and recedes with
-    /// `Modifier::DIM` instead of claiming the DarkGray palette slot, which
-    /// users theme arbitrarily and which is near-invisible on some schemes.
-    pub const DIM: Color = Color::Reset;
 
     // Column
     pub const COLUMN_HEADER: Color = Color::Reset;
@@ -123,10 +119,15 @@ impl Theme {
     pub const HINT_KEY: Color = Color::Reset;
     pub const HINT_DESC: Color = Color::Reset;
 
+    /// Secondary text: keeps the terminal's own foreground and recedes with
+    /// `Modifier::DIM`, rather than claiming the DarkGray palette slot that
+    /// users theme arbitrarily and that vanishes on some schemes.
+    ///
+    /// There is deliberately no `DIM` colour constant. Dimness cannot be
+    /// expressed as a colour here, and offering one let call sites take the
+    /// colour without the modifier and silently render at full brightness.
     pub fn dim_style() -> Style {
-        Style::default()
-            .fg(Self::DIM)
-            .add_modifier(Modifier::DIM)
+        Style::default().fg(Self::FG).add_modifier(Modifier::DIM)
     }
 
     pub fn status_style() -> Style {
@@ -218,15 +219,6 @@ mod tests {
     }
 
     #[test]
-    fn tag_color_different_tags_may_differ() {
-        // Not guaranteed but very likely for distinct strings
-        let c1 = Theme::tag_color("bug");
-        let c2 = Theme::tag_color("feature");
-        // At minimum both should be valid colors (not panic)
-        let _ = (c1, c2);
-    }
-
-    #[test]
     fn tag_color_empty_string_no_panic() {
         let _ = Theme::tag_color("");
     }
@@ -270,7 +262,6 @@ mod tests {
         // distinct values and the base six are not enough.
         for (name, colour) in [
             ("FG", Theme::FG),
-            ("DIM", Theme::DIM),
             ("COLUMN_HEADER", Theme::COLUMN_HEADER),
             ("COLUMN_BORDER", Theme::COLUMN_BORDER),
             ("COLUMN_FOCUSED_BORDER", Theme::COLUMN_FOCUSED_BORDER),
@@ -358,36 +349,26 @@ mod tests {
         assert_eq!(Theme::NEW_CARD_TITLE, Color::Green);
     }
 
-    #[test]
-    fn semantic_content_colors_are_never_dim() {
-        // Anti-regression: titles, assignees and tags must never render dimmed.
-        // Dimness is a modifier now, not a palette slot, so compare whole
-        // styles: comparing the colour constants alone would pass happily while
-        // a title carried Modifier::DIM.
-        for (name, colour) in [
-            ("CARD_TITLE", Theme::CARD_TITLE),
-            ("NEW_CARD_TITLE", Theme::NEW_CARD_TITLE),
-            ("ASSIGNEE", Theme::ASSIGNEE),
-        ] {
-            let content = Style::default().fg(colour);
-            assert_ne!(content, Theme::dim_style(), "{name} renders as dim");
-            assert!(
-                !content.add_modifier.contains(Modifier::DIM),
-                "{name} is dimmed"
-            );
-        }
-    }
+    // "Content is never dim" is deliberately NOT tested here. Both attempts to
+    // do so were vacuous: a `Style::default().fg(colour)` built in the test body
+    // cannot carry a modifier, so asserting it has none always passes. Dimness
+    // is a property of a painted cell, so it is checked where cells exist:
+    // `board_view::tests::content_is_never_dim_on_screen`.
 
     #[test]
-    fn tag_color_never_returns_dim() {
-        // Use enough distinct tags to cover all 12 palette slots.
+    fn tag_colors_spread_across_the_palette() {
+        // Determinism is covered by `tag_color_deterministic`; this pins the
+        // other half of the contract, that tags do not collapse onto one slot.
         let tags = [
             "bug", "feature", "docs", "refactor", "test", "urgent",
             "chore", "perf", "ci", "style", "security", "infra",
-            "deploy", "ui", "api", "backend",
         ];
-        for tag in &tags {
-            assert_ne!(Theme::tag_color(tag), Theme::DIM, "tag '{tag}' should never be DIM");
-        }
+        let colors: std::collections::HashSet<_> =
+            tags.iter().map(|t| Theme::tag_color(t)).collect();
+        assert!(
+            colors.len() > 4,
+            "tags collapsed onto {} colour(s); they stop being distinguishable",
+            colors.len()
+        );
     }
 }

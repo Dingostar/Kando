@@ -498,6 +498,10 @@ mod tests {
     #[test]
     fn normal_c_enters_column_mode() {
         assert_eq!(map_key(key(KeyCode::Char('c')), &Mode::Normal), Action::EnterColumnMode);
+    }
+
+    #[test]
+    fn normal_z_toggles_compact_view() {
         assert_eq!(
             map_key(key(KeyCode::Char('z')), &Mode::Normal),
             Action::ToggleCompactView

@@ -7,7 +7,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use super::board_view::card_border_color;
+use super::board_view::card_border_style;
 use super::theme::{Icons, Theme};
 use kando_core::board::age::{format_age, staleness};
 use kando_core::board::{Card, Policies};
@@ -17,16 +17,15 @@ pub fn render_card_detail(f: &mut Frame, area: Rect, card: &Card, policies: &Pol
 
     let panel_area = super::overlay_rect(area);
 
-
     let stale = staleness(card, policies, now);
     let is_overdue = card.is_overdue(now.date_naive());
-    let border_color = card_border_color(card.is_blocked(), is_overdue, true, stale, false);
+    let border_style = card_border_style(card.is_blocked(), is_overdue, true, stale, false);
 
     let title = Line::from(Span::styled(
         format!(" {} ", card.id),
         Style::default().fg(Theme::FG).add_modifier(Modifier::BOLD),
     ));
-    let inner = super::render_overlay_frame(f, panel_area, title, border_color);
+    let inner = super::render_overlay_frame(f, panel_area, area, title, border_style);
 
     if inner.height == 0 {
         return;
@@ -186,9 +185,9 @@ pub fn render_card_detail(f: &mut Frame, area: Rect, card: &Card, policies: &Pol
     if max_scroll > 0 {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .track_symbol(Some("│"))
-            .track_style(Style::default().fg(border_color))
+            .track_style(border_style)
             .thumb_symbol("▐")
-            .thumb_style(Style::default().fg(border_color))
+            .thumb_style(border_style)
             .begin_symbol(None)
             .end_symbol(None);
         let mut scrollbar_state =

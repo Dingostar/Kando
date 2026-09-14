@@ -51,7 +51,7 @@ Your board consists of **columns** (like Backlog, In Progress, Done) that contai
 
 ### Navigating the Board
 
-The interface is designed for speed. You don't need a mouse.
+You don't need a mouse.
 
 - `h` / `l` - Move between columns
 - `j` / `k` - Move between cards
@@ -62,6 +62,7 @@ The interface is designed for speed. You don't need a mouse.
 - `n` / `N` - Jump to next / previous search match
 - `f` - Open filter menu
 - `s` - Sort current column
+- `z` - Compact view: fold every card to one row
 - `m` - Show board metrics
 - `r` - Reload board from disk
 - `u` - Undo last delete
@@ -70,6 +71,13 @@ The interface is designed for speed. You don't need a mouse.
 - `?` - Show keybinding reference
 - `q` - Quit
 - `Esc` - Clear any active filters
+
+### Compact View
+
+Press `z` to fold every card to a single row. Useful when a column has grown
+long enough that you care more about which cards are there than what is on them.
+
+![Kando in compact view](screenshot_compact.png)
 
 ### Minor Modes
 
@@ -164,7 +172,7 @@ Press `Enter` on a card to see its full content in a detail pane. From there:
 - `Esc` or `q` - Close detail view
 
 ## Piping
-Kando lets you pipe any card's raw file contents to a shell command, making it composable with the Unix ecosystem: Clipboard utilities, APIs, AI agents, issue trackers or your own scripts. The card itself is never modified, since piping is a read-only operation.
+Kando can pipe any card's raw file to a shell command, so the board composes with the rest of your terminal: clipboard utilities, APIs, AI agents, issue trackers, your own scripts. Piping is read-only, so the card is never modified.
 
 ### Environment variables
 Every pipe command also receives the following environment variables so
@@ -185,7 +193,7 @@ Tags, assignees, column, due, and blocked values are empty strings when unset.
 
 ## Team Collaboration
 
-Kando can sync your board with a git repository, making it easy to collaborate with a team:
+Kando can sync your board with a git repository, so a team can share one board:
 
 ```sh
 # Initialize with git sync enabled
@@ -207,7 +215,7 @@ How it works:
 
 ## Board Policies
 
-Kando can enforce a few lightweight rules to keep your board healthy. All thresholds are configurable and can be disabled by setting them to `0`.
+Kando can enforce a few rules about pace and capacity. All thresholds are configurable, and setting one to `0` turns it off.
 
 ### WIP Limits
 
@@ -219,7 +227,7 @@ kando config wip in-progress 3
 
 ### Staleness Warnings
 
-Cards that go untouched for a configurable number of days get a visual indicator so they don't slip through the cracks.
+Cards that go untouched for a configurable number of days get a visual indicator.
 
 ```sh
 kando config stale-days 14
@@ -244,7 +252,7 @@ kando config archive-after-days 7
 
 ## Command Line Interface
 
-Kando isn't just a TUI. You can also manage cards from the command line for scripting and automation.
+You can manage cards from the command line too, which is what you want for scripts and automation.
 
 **Important:** CLI commands write changes to disk but do not automatically sync with the remote. If your board uses git sync, run `kando sync` after any mutations to push your changes.
 
@@ -287,7 +295,7 @@ kando col hide backlog
 ```
 
 ### Templates
-Templates reduce friction for recurring card types like bugs, features, or chores. They are stored as `.md` files with TOML frontmatter in `.kando/templates/` and can set priority, tags, assignees, blocked status, due date offset, and body content.
+Templates save retyping the same fields for cards you create often, like bugs, features, or chores. They are stored as `.md` files with TOML frontmatter in `.kando/templates/` and can set priority, tags, assignees, blocked status, due date offset, and body content.
 
 ```sh
 kando template list              # list all templates
@@ -338,7 +346,7 @@ If something feels off, `kando doctor` takes a look at your board and tells you 
 kando doctor
 ```
 
-This makes it easy to integrate Kando with git hooks, CI pipelines, or shell scripts.
+`kando doctor` exits non-zero when a check fails, so you can run it from CI or a git hook.
 
 ### Hooks
 
@@ -419,7 +427,7 @@ kando metrics --csv
 kando template list --csv
 ```
 
-This makes it easy to pipe board data into other tools:
+Board data then goes straight into whatever else you use:
 
 ```sh
 kando list --csv | cut -d, -f1,5    # just IDs and titles

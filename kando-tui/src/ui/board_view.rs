@@ -1,6 +1,6 @@
 use fuzzy_matcher::skim::SkimMatcherV2;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -49,19 +49,28 @@ pub(crate) fn fit_icons<'a>(candidates: &[(&'a str, Style)], avail_width: usize)
 ///
 /// Selection is expressed via `BorderType::Thick + Modifier::BOLD`, not via
 /// color, so `is_selected` is intentionally absent from this function.
-pub(crate) fn card_border_color(blocked: bool, is_overdue: bool, is_col_focused: bool, stale: Staleness, is_new: bool) -> Color {
+pub(crate) fn card_border_style(
+    blocked: bool,
+    is_overdue: bool,
+    is_col_focused: bool,
+    stale: Staleness,
+    is_new: bool,
+) -> Style {
     if blocked {
-        Theme::BLOCKER
-    } else if is_overdue {
-        Theme::OVERDUE
-    } else {
-        match stale {
-            Staleness::VeryStale => Theme::VERY_STALE,
-            Staleness::Stale => Theme::STALE,
-            Staleness::Fresh if is_new => Theme::NEW_CARD_TITLE,
-            Staleness::Fresh if is_col_focused => Theme::CARD_BORDER,
-            Staleness::Fresh => Theme::DIM,
-        }
+        return Style::default().fg(Theme::BLOCKER);
+    }
+    if is_overdue {
+        return Style::default().fg(Theme::OVERDUE);
+    }
+    match stale {
+        Staleness::VeryStale => Style::default().fg(Theme::VERY_STALE),
+        Staleness::Stale => Style::default().fg(Theme::STALE),
+        Staleness::Fresh if is_new => Style::default().fg(Theme::NEW_CARD_TITLE),
+        Staleness::Fresh if is_col_focused => Style::default().fg(Theme::CARD_BORDER),
+        // Receding is a modifier, not a colour. Returning a Color here meant
+        // this case became indistinguishable from the focused one the moment
+        // both constants resolved to Reset, and nothing could catch it.
+        Staleness::Fresh => Style::default().fg(Theme::CARD_BORDER).add_modifier(Modifier::DIM),
     }
 }
 
@@ -302,7 +311,12 @@ fn truncate_to_width(text: &str, width: usize) -> String {
     if text.width() <= width {
         return text.to_string();
     }
-    let avail = width.saturating_sub(1); // room for the ellipsis
+    if width == 0 {
+        // An ellipsis is still one cell wide, so returning one here overflows
+        // the caller's rect by a column.
+        return String::new();
+    }
+    let avail = width - 1; // room for the ellipsis
     let truncated: String = text
         .graphemes(true)
         .scan(0, |used, g| {
@@ -369,17 +383,25 @@ fn render_compact_card(
         .saturating_sub(marker.width() + glyph_width + 1)
         .max(1);
 
+    // Compact rows have no border to carry the focus signal, so the title does
+    // it: a row in an unfocused column recedes by modifier, exactly as a card's
+    // border does. New cards are exempt here for the same reason they are in
+    // `card_border_style` — being new outranks being out of focus.
+    let mut title_modifier = if is_selected {
+        Modifier::BOLD
+    } else {
+        Modifier::empty()
+    };
+    if !is_col_focused && !is_new {
+        title_modifier |= Modifier::DIM;
+    }
     let title_style = Style::default()
         .fg(if is_new {
             Theme::NEW_CARD_TITLE
         } else {
             Theme::CARD_TITLE
         })
-        .add_modifier(if is_selected {
-            Modifier::BOLD
-        } else {
-            Modifier::empty()
-        });
+        .add_modifier(title_modifier);
 
     let title = truncate_to_width(&card.title, title_width);
     let mut spans = vec![
@@ -395,17 +417,25 @@ fn render_compact_card(
         }
         spans.push(Span::styled(text, style));
     }
-    let _ = is_col_focused;
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// A card is two border rows, an id line and a title line, plus a metadata row
-/// only when there are assignees or tags to put in it. Blank rows on cards that
-/// have neither were costing a row each.
+/// only when there are assignees or tags to put in it.
 ///
-/// This makes cards of differing heights, so rows no longer line up across
-/// columns. That is a real cost on a board whose premise is comparing columns,
-/// paid to stop showing an empty line on every bare card.
+/// Height follows the card's contents, which means it converges to a uniform
+/// grid whenever a board is used consistently: a team that tags and assigns
+/// everything gets 5 rows throughout, and someone who uses neither gets 4 rows
+/// throughout and a denser board for it. Only a board that mixes the two is
+/// ragged, and there the difference in height is carrying the same information
+/// the metadata row is.
+///
+/// A fixed height would match exactly one of those boards and put a blank row
+/// inside every bare card on the others, which reads as metadata that failed to
+/// load rather than as breathing room. Alignment across columns is not the
+/// tradeoff it first appears to be either: a row is not a record here, so the
+/// third card in one column has nothing to do with the third in the next.
+/// Compact view is where scanning many titles wants a regular grid.
 pub(crate) fn card_height(card: &Card) -> u16 {
     let has_metadata = !card.assignees.is_empty() || !card.tags.is_empty();
     if has_metadata { 5 } else { 4 }
@@ -464,13 +494,11 @@ fn render_card(
     let is_new = is_new_card(card.created, now);
     let is_overdue = card.is_overdue(now.date_naive());
 
-    let border_color = card_border_color(card.is_blocked(), is_overdue, is_col_focused, stale, is_new);
-
     let selected_mod = if is_selected { Modifier::BOLD } else { Modifier::empty() };
 
-    let border_style = Style::default()
-        .fg(border_color)
-        .add_modifier(selected_mod);
+    let border_style =
+        card_border_style(card.is_blocked(), is_overdue, is_col_focused, stale, is_new)
+            .add_modifier(selected_mod);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -541,12 +569,16 @@ fn render_card(
     let padding_needed =
         (inner.width as usize).saturating_sub(left_width + glyphs_width + 1);
 
-    let age_color = if is_new { Theme::NEW_CARD_TITLE } else { Theme::DIM };
+    let age_style = if is_new {
+        Style::default().fg(Theme::NEW_CARD_TITLE)
+    } else {
+        Theme::dim_style()
+    };
     let mut line1_spans = vec![
         Span::styled(marker_display, marker_style),
-        Span::styled(&card.id, Style::default().fg(Theme::DIM).add_modifier(selected_mod)),
+        Span::styled(&card.id, Theme::dim_style().add_modifier(selected_mod)),
         Span::raw(" "),
-        Span::styled(age_str, Style::default().fg(age_color).add_modifier(selected_mod)),
+        Span::styled(age_str, age_style.add_modifier(selected_mod)),
         Span::raw(" ".repeat(padding_needed)),
     ];
     line1_spans.extend(right_glyphs);
@@ -615,8 +647,36 @@ fn render_card(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kando_core::board::{Board, Column, Policies};
+    use ratatui::buffer::Buffer;
 
     fn s() -> Style { Style::default() }
+
+    fn test_now() -> DateTime<Utc> {
+        "2026-01-15T12:00:00Z".parse().unwrap()
+    }
+
+    /// One column of `count` plain, fresh cards.
+    fn board_with(column: &str, count: usize) -> Board {
+        Board {
+            name: "Test".into(),
+            next_card_id: 100,
+            policies: Policies::default(),
+            sync_branch: None,
+            created_at: None,
+            nerd_font: false,
+            columns: vec![Column {
+                slug: column.to_lowercase(),
+                name: column.to_string(),
+                order: 0,
+                wip_limit: None,
+                hidden: false,
+                cards: (0..count)
+                    .map(|i| Card::new(format!("01{i:02}"), format!("Card {i}")))
+                    .collect(),
+            }],
+        }
+    }
 
     // ── total_icon_width ──────────────────────────────────────────────────────
 
@@ -734,93 +794,101 @@ mod tests {
         assert_eq!(r[1].0, "X");
     }
 
-    // ── card_border_color ─────────────────────────────────────────────────────
+    // ── card_border_style ─────────────────────────────────────────────────────
 
     #[test]
     fn border_color_blocked_wins_over_all() {
-        assert_eq!(card_border_color(true, false, true,  Staleness::Fresh, false),     Theme::BLOCKER);
-        assert_eq!(card_border_color(true, false, false, Staleness::Fresh, false),     Theme::BLOCKER);
-        assert_eq!(card_border_color(true, false, false, Staleness::VeryStale, false), Theme::BLOCKER);
-        assert_eq!(card_border_color(true, false, true,  Staleness::Stale, false),     Theme::BLOCKER);
+        assert_eq!(card_border_style(true, false, true,  Staleness::Fresh, false).fg,     Some(Theme::BLOCKER));
+        assert_eq!(card_border_style(true, false, false, Staleness::Fresh, false).fg,     Some(Theme::BLOCKER));
+        assert_eq!(card_border_style(true, false, false, Staleness::VeryStale, false).fg, Some(Theme::BLOCKER));
+        assert_eq!(card_border_style(true, false, true,  Staleness::Stale, false).fg,     Some(Theme::BLOCKER));
         // Blocker wins even for new cards
-        assert_eq!(card_border_color(true, false, true,  Staleness::Fresh, true),      Theme::BLOCKER);
+        assert_eq!(card_border_style(true, false, true,  Staleness::Fresh, true).fg,      Some(Theme::BLOCKER));
         // Blocker wins even for overdue cards
-        assert_eq!(card_border_color(true, true, true,  Staleness::Fresh, false),      Theme::BLOCKER);
+        assert_eq!(card_border_style(true, true, true,  Staleness::Fresh, false).fg,      Some(Theme::BLOCKER));
     }
 
     #[test]
     fn border_color_overdue_beats_staleness() {
-        assert_eq!(card_border_color(false, true, true,  Staleness::Fresh, false), Theme::OVERDUE);
-        assert_eq!(card_border_color(false, true, false, Staleness::Stale, false), Theme::OVERDUE);
-        assert_eq!(card_border_color(false, true, true,  Staleness::VeryStale, false), Theme::OVERDUE);
+        assert_eq!(card_border_style(false, true, true,  Staleness::Fresh, false).fg, Some(Theme::OVERDUE));
+        assert_eq!(card_border_style(false, true, false, Staleness::Stale, false).fg, Some(Theme::OVERDUE));
+        assert_eq!(card_border_style(false, true, true,  Staleness::VeryStale, false).fg, Some(Theme::OVERDUE));
     }
 
     #[test]
     fn border_color_unfocused_fresh_returns_dim() {
-        assert_eq!(card_border_color(false, false, false, Staleness::Fresh, false), Theme::DIM);
+        // Receding is a modifier: asserting a colour here passed for free once
+        // DIM and CARD_BORDER both resolved to Reset.
+        let unfocused = card_border_style(false, false, false, Staleness::Fresh, false);
+        let focused = card_border_style(false, false, true, Staleness::Fresh, false);
+        assert!(unfocused.add_modifier.contains(Modifier::DIM));
+        assert!(!focused.add_modifier.contains(Modifier::DIM));
+        assert_ne!(unfocused, focused, "unfocused fresh cards must recede");
     }
 
     #[test]
     fn border_color_unfocused_stale_returns_stale_color() {
-        assert_eq!(card_border_color(false, false, false, Staleness::Stale, false), Theme::STALE);
+        assert_eq!(card_border_style(false, false, false, Staleness::Stale, false).fg, Some(Theme::STALE));
     }
 
     #[test]
     fn border_color_unfocused_very_stale_returns_very_stale_color() {
-        assert_eq!(card_border_color(false, false, false, Staleness::VeryStale, false), Theme::VERY_STALE);
+        assert_eq!(card_border_style(false, false, false, Staleness::VeryStale, false).fg, Some(Theme::VERY_STALE));
     }
 
     #[test]
     fn border_color_focused_fresh_is_card_border() {
-        assert_eq!(card_border_color(false, false, true, Staleness::Fresh, false), Theme::CARD_BORDER);
+        let focused = card_border_style(false, false, true, Staleness::Fresh, false);
+        assert_eq!(focused.fg, Some(Theme::CARD_BORDER));
+        assert!(!focused.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]
     fn border_color_focused_stale_is_stale_color() {
-        assert_eq!(card_border_color(false, false, true, Staleness::Stale, false), Theme::STALE);
+        assert_eq!(card_border_style(false, false, true, Staleness::Stale, false).fg, Some(Theme::STALE));
     }
 
     #[test]
     fn border_color_focused_very_stale_is_very_stale_color() {
-        assert_eq!(card_border_color(false, false, true, Staleness::VeryStale, false), Theme::VERY_STALE);
+        assert_eq!(card_border_style(false, false, true, Staleness::VeryStale, false).fg, Some(Theme::VERY_STALE));
     }
 
     #[test]
     fn border_color_stale_always_shows_semantic_color() {
-        assert_eq!(card_border_color(false, false, true, Staleness::Stale, false), Theme::STALE);
-        assert_eq!(card_border_color(false, false, false, Staleness::Stale, false), Theme::STALE);
+        assert_eq!(card_border_style(false, false, true, Staleness::Stale, false).fg, Some(Theme::STALE));
+        assert_eq!(card_border_style(false, false, false, Staleness::Stale, false).fg, Some(Theme::STALE));
     }
 
     #[test]
     fn border_color_very_stale_always_shows_semantic_color() {
-        assert_eq!(card_border_color(false, false, true, Staleness::VeryStale, false), Theme::VERY_STALE);
-        assert_eq!(card_border_color(false, false, false, Staleness::VeryStale, false), Theme::VERY_STALE);
+        assert_eq!(card_border_style(false, false, true, Staleness::VeryStale, false).fg, Some(Theme::VERY_STALE));
+        assert_eq!(card_border_style(false, false, false, Staleness::VeryStale, false).fg, Some(Theme::VERY_STALE));
     }
 
     #[test]
     fn border_color_new_card_is_green() {
         // New card border is green regardless of column focus
-        assert_eq!(card_border_color(false, false, true, Staleness::Fresh, true), Theme::NEW_CARD_TITLE);
-        assert_eq!(card_border_color(false, false, false, Staleness::Fresh, true), Theme::NEW_CARD_TITLE);
+        assert_eq!(card_border_style(false, false, true, Staleness::Fresh, true).fg, Some(Theme::NEW_CARD_TITLE));
+        assert_eq!(card_border_style(false, false, false, Staleness::Fresh, true).fg, Some(Theme::NEW_CARD_TITLE));
     }
 
     #[test]
     fn border_color_staleness_beats_new_card() {
         // Staleness takes priority over the new-green signal
-        assert_eq!(card_border_color(false, false, false, Staleness::Stale, true), Theme::STALE);
-        assert_eq!(card_border_color(false, false, false, Staleness::VeryStale, true), Theme::VERY_STALE);
+        assert_eq!(card_border_style(false, false, false, Staleness::Stale, true).fg, Some(Theme::STALE));
+        assert_eq!(card_border_style(false, false, false, Staleness::VeryStale, true).fg, Some(Theme::VERY_STALE));
     }
 
     #[test]
     fn border_color_overdue_beats_new_card() {
-        assert_eq!(card_border_color(false, true, true, Staleness::Fresh, true), Theme::OVERDUE);
-        assert_eq!(card_border_color(false, true, false, Staleness::Fresh, true), Theme::OVERDUE);
+        assert_eq!(card_border_style(false, true, true, Staleness::Fresh, true).fg, Some(Theme::OVERDUE));
+        assert_eq!(card_border_style(false, true, false, Staleness::Fresh, true).fg, Some(Theme::OVERDUE));
     }
 
     #[test]
     fn border_color_blocked_beats_overdue_with_stale() {
-        assert_eq!(card_border_color(true, true, false, Staleness::Stale, false), Theme::BLOCKER);
-        assert_eq!(card_border_color(true, true, true, Staleness::VeryStale, false), Theme::BLOCKER);
+        assert_eq!(card_border_style(true, true, false, Staleness::Stale, false).fg, Some(Theme::BLOCKER));
+        assert_eq!(card_border_style(true, true, true, Staleness::VeryStale, false).fg, Some(Theme::BLOCKER));
     }
 
     // ── is_new_card ─────────────────────────────────────────────────────────
@@ -911,43 +979,422 @@ mod tests {
         let cut = truncate_to_width(combined, 2);
         assert!(cut.ends_with('…'));
         assert!(cut.width() <= 2);
-        // Degenerate widths must not panic.
-        assert!(truncate_to_width("anything", 0).width() <= 1);
+        // A zero-cell budget yields zero cells: an ellipsis would overflow.
+        assert_eq!(truncate_to_width("anything", 0), "");
+    }
+
+    // ── rendered output ───────────────────────────────────────────────────────
+    //
+    // These render through `render_board` and read the resulting cells. Asserting
+    // on the helpers alone proved worthless: deleting both the scrollbar
+    // reservation and the compact height branch left all 846 tests passing.
+
+    fn render_to_buffer(board: &Board, state: &AppState, w: u16, h: u16) -> Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|f| render_board(f, f.area(), board, state, test_now()))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// The cells of one row, as a string.
+    fn row(buf: &Buffer, y: u16) -> String {
+        (buf.area.x..buf.area.right())
+            .map(|x| buf[(x, y)].symbol())
+            .collect()
     }
 
     #[test]
     fn compact_rows_are_one_line_each() {
-        // The whole point: height stops depending on the card's contents.
-        let mut card = Card::new("0001".to_string(), "Tagged".to_string());
-        card.tags.push("infra".to_string());
-        assert_eq!(card_height(&card), 5);
-        // Compact overrides that in render_column; the heights it lays out are
-        // uniform, so a column fits as many cards as it has rows.
-        let heights = vec![1u16; 5];
-        assert_eq!(visible_count(&heights, 0, 5), 5);
-        assert_eq!(scroll_offset_for(&heights, 4, 3), 2);
+        // Six cards, two of them carrying metadata that would push a full card
+        // to five rows. In compact they must occupy one row apiece, so all six
+        // appear in a viewport that could not hold two full cards.
+        let mut board = board_with("Backlog", 6);
+        board.columns[0].cards[1].tags.push("infra".to_string());
+        board.columns[0].cards[3].assignees.push("ada".to_string());
+
+        let mut state = AppState::new();
+        state.compact = true;
+        let buf = render_to_buffer(&board, &state, 40, 10);
+
+        let text: String = (0..10).map(|y| row(&buf, y)).collect::<Vec<_>>().join("\n");
+        for n in 0..6 {
+            assert!(
+                text.contains(&format!("Card {n}")),
+                "compact dropped card {n}; rows are not one line each:\n{text}"
+            );
+        }
+        // And no card drew a border: a box would mean full cards leaked through.
+        assert!(
+            !text.contains('╭') && !text.contains('┌'),
+            "compact rows drew card borders:\n{text}"
+        );
     }
 
     #[test]
     fn a_scrolling_column_keeps_the_bar_off_the_card_border() {
-        // The column box used to absorb the scrollbar; without it the bar landed
-        // on the card's own right border and ate it.
+        // The column box used to absorb the scrollbar. Without it the bar landed
+        // on the card's own right border and ate it. Check exact columns: bar at
+        // the far right, a blank gap, then the card's border. Searching for "a
+        // border somewhere to the left" is not enough — it finds the left border
+        // and passes even with the reservation deleted.
+        let board = board_with("Backlog", 12);
+        let state = AppState::new();
         let width = 40u16;
-        let scrolling_width = width - SCROLLBAR_RESERVE;
-        assert!(scrolling_width < width, "no column reserved for the bar");
-        assert_eq!(
-            width - scrolling_width,
-            2,
-            "one column for the bar, one so it does not touch the card"
-        );
-        // A column too narrow to reserve anything must not underflow.
-        for narrow in 0..=SCROLLBAR_RESERVE {
-            let card = if narrow > SCROLLBAR_RESERVE {
-                narrow - SCROLLBAR_RESERVE
-            } else {
-                narrow
-            };
-            assert!(card <= narrow);
+        let buf = render_to_buffer(&board, &state, width, 14);
+        let dump = || (0..14).map(|y| row(&buf, y)).collect::<Vec<_>>().join("\n");
+
+        let mut bar_rows = 0;
+        for y in 2..14 {
+            let cells: Vec<char> = row(&buf, y).chars().collect();
+            // ratatui paints the bar with half-block glyphs, not a box line.
+            if !matches!(cells[usize::from(width - 1)], '▐' | '█' | '░' | '▌') {
+                continue;
+            }
+            bar_rows += 1;
+            assert_eq!(
+                cells[usize::from(width - 2)],
+                ' ',
+                "row {y}: no gap between card and scrollbar:\n{}",
+                dump()
+            );
+            assert!(
+                matches!(cells[usize::from(width - 3)], '│' | '╮' | '╯' | '┃' | '┓' | '┛'),
+                "row {y}: card's right border is missing at x={}; the bar ate it:\n{}",
+                width - 3,
+                dump()
+            );
         }
+        assert!(bar_rows > 0, "12 cards in 14 rows drew no scrollbar:\n{}", dump());
+    }
+
+    /// Cells painted for the first occurrence of `needle`, or None.
+    ///
+    /// Offsets are counted in display columns, not chars: one wide glyph
+    /// occupies two cells, so a char count would drift on CJK text.
+    fn cells_of(buf: &Buffer, needle: &str) -> Option<Vec<ratatui::buffer::Cell>> {
+        for y in buf.area.y..buf.area.bottom() {
+            let line = row(buf, y);
+            if let Some(byte) = line.find(needle) {
+                let col = line[..byte].width() as u16;
+                return Some(
+                    (0..needle.width() as u16)
+                        .map(|i| buf[(buf.area.x + col + i, y)].clone())
+                        .collect(),
+                );
+            }
+        }
+        None
+    }
+
+    /// Two columns side by side, the first focused, plus a hidden one.
+    fn two_column_board() -> Board {
+        let mut board = board_with("Backlog", 2);
+        board.columns.push(Column {
+            slug: "done".into(),
+            name: "Done".into(),
+            order: 1,
+            wip_limit: None,
+            hidden: false,
+            cards: vec![Card::new("0200".into(), "Shipped".into())],
+        });
+        board
+    }
+
+    #[test]
+    fn a_column_renders_its_name_and_card_count() {
+        // The branch's headline change: columns get a heading and a rule instead
+        // of a box. Deleting the heading render left all 850 tests passing, so
+        // assert the text actually lands on screen.
+        let board = two_column_board();
+        let state = AppState::new();
+        let buf = render_to_buffer(&board, &state, 80, 14);
+        let dump = || (0..14).map(|y| row(&buf, y)).collect::<Vec<_>>().join("\n");
+
+        let head = row(&buf, 0);
+        assert!(head.contains("Backlog"), "no column name:\n{}", dump());
+        assert!(head.contains("(2)"), "no card count for Backlog:\n{}", dump());
+        assert!(head.contains("Done"), "second column has no name:\n{}", dump());
+        assert!(head.contains("(1)"), "no card count for Done:\n{}", dump());
+    }
+
+    #[test]
+    fn an_unfocused_column_rule_recedes() {
+        // Same failure mode as the bug that started this review, one level up:
+        // the rule is the column's only chrome, so it is the only thing that can
+        // carry focus. Cards had two tests for this; the column rule had none.
+        let board = two_column_board();
+        let state = AppState::new();
+        let buf = render_to_buffer(&board, &state, 80, 14);
+        let rule_row = 1;
+
+        // Column 0 is focused by default, column 1 is not. Find a rule cell in
+        // each half, identified by the glyph rather than by a computed x.
+        let mut focused_dim = None;
+        let mut unfocused_dim = None;
+        for x in 0..80u16 {
+            let cell = &buf[(x, rule_row)];
+            if cell.symbol() != "─" {
+                continue;
+            }
+            if x < 40 {
+                focused_dim.get_or_insert(cell.modifier.contains(Modifier::DIM));
+            } else {
+                unfocused_dim.get_or_insert(cell.modifier.contains(Modifier::DIM));
+            }
+        }
+        assert_eq!(
+            focused_dim,
+            Some(false),
+            "the focused column's rule should not recede"
+        );
+        assert_eq!(
+            unfocused_dim,
+            Some(true),
+            "the unfocused column's rule should recede"
+        );
+    }
+
+    #[test]
+    fn a_hidden_column_keeps_a_dashed_rule() {
+        // The dash is the only thing distinguishing a hidden column now that the
+        // box is gone; swapping it for a solid rule broke no test.
+        let mut board = two_column_board();
+        board.columns[1].hidden = true;
+        let mut state = AppState::new();
+        // The dashed rule only renders when hidden columns are revealed; that is
+        // the one situation in which a hidden column needs to be tellable apart.
+        state.show_hidden_columns = true;
+        let buf = render_to_buffer(&board, &state, 80, 14);
+        let rule_row = row(&buf, 1);
+        assert!(
+            rule_row.contains('╌'),
+            "a hidden column drew a solid rule:\n{rule_row}"
+        );
+        assert!(
+            rule_row.contains('─'),
+            "the visible column should still draw a solid rule:\n{rule_row}"
+        );
+    }
+
+    #[test]
+    fn adjacent_columns_do_not_touch() {
+        // COLUMN_GAP is the whole replacement for the separation the column box
+        // used to provide. At 0, adjacent cards' borders sit flush against each
+        // other, which is the condition removing the box created.
+        let board = two_column_board();
+        let state = AppState::new();
+        let buf = render_to_buffer(&board, &state, 80, 14);
+        let dump = || (0..14).map(|y| row(&buf, y)).collect::<Vec<_>>().join("\n");
+
+        // On every row that draws two cards, there must be a blank run between
+        // the first card's right border and the second's left.
+        let mut checked = 0;
+        for y in 2..14 {
+            let line = row(&buf, y);
+            let chars: Vec<char> = line.chars().collect();
+            let borders: Vec<usize> = chars
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| matches!(**c, '│' | '┃' | '╭' | '╮' | '┏' | '┓' | '╰' | '╯' | '┗' | '┛'))
+                .map(|(i, _)| i)
+                .collect();
+            if borders.len() < 4 {
+                continue; // not a row with two cards on it
+            }
+            // The gap sits between the first card's right border and the second
+            // card's left border.
+            let left_card_right = borders[1];
+            let right_card_left = borders[2];
+            assert!(
+                right_card_left > left_card_right + 1,
+                "row {y}: columns touch at {left_card_right}/{right_card_left}:\n{}",
+                dump()
+            );
+            for (offset, painted) in chars[(left_card_right + 1)..right_card_left]
+                .iter()
+                .enumerate()
+            {
+                assert_eq!(
+                    *painted,
+                    ' ',
+                    "row {y}: something painted in the column gap at {}:\n{}",
+                    left_card_right + 1 + offset,
+                    dump()
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "found no row with two cards to check:\n{}", dump());
+    }
+
+    #[test]
+    fn a_new_card_stays_bright_in_an_unfocused_compact_column() {
+        // The exemption a comment claims and nothing checked: being new outranks
+        // being out of focus, the same precedence card_border_style applies.
+        let mut board = board_with("Backlog", 1);
+        board.columns.push(Column {
+            slug: "done".into(),
+            name: "Done".into(),
+            order: 1,
+            wip_limit: None,
+            hidden: false,
+            cards: vec![
+                {
+                    let mut fresh = Card::new("0200".into(), "JustAdded".into());
+                    fresh.created = test_now();
+                    fresh
+                },
+                {
+                    let mut old = Card::new("0201".into(), "LongSince".into());
+                    old.created = test_now() - chrono::Duration::days(30);
+                    old
+                },
+            ],
+        });
+        let mut state = AppState::new();
+        state.compact = true;
+        let buf = render_to_buffer(&board, &state, 80, 10);
+
+        let dim = |needle: &str| {
+            cells_of(&buf, needle)
+                .unwrap_or_else(|| panic!("{needle:?} never reached the screen"))[0]
+                .modifier
+                .contains(Modifier::DIM)
+        };
+        assert!(
+            !dim("JustAdded"),
+            "a new card should stay bright even in an unfocused column"
+        );
+        assert!(
+            dim("LongSince"),
+            "an ordinary card in an unfocused column should recede"
+        );
+    }
+
+    #[test]
+    fn content_is_never_dim_on_screen() {
+        // Titles, assignees and tags carry meaning, so they must render at full
+        // strength. Only chrome recedes. This has to read painted cells: the two
+        // previous attempts built a Style in the test body and asserted it had no
+        // DIM modifier, which a locally-built style can never have. Rendering
+        // every title with dim_style() left all 850 of those tests passing.
+        let mut board = board_with("Backlog", 1);
+        board.columns[0].cards[0].title = "Meaningful".into();
+        board.columns[0].cards[0].assignees.push("ada".into());
+        board.columns[0].cards[0].tags.push("infra".into());
+        // A second column so the assertion covers unfocused cards too: in card
+        // view the border carries focus, never the content.
+        board.columns.push(Column {
+            slug: "done".into(),
+            name: "Done".into(),
+            order: 1,
+            wip_limit: None,
+            hidden: false,
+            cards: vec![{
+                let mut c = Card::new("0200".into(), "Elsewhere".into());
+                c.assignees.push("bob".into());
+                c.tags.push("security".into());
+                c
+            }],
+        });
+        let state = AppState::new();
+        let buf = render_to_buffer(&board, &state, 80, 14);
+        let dump = || (0..14).map(|y| row(&buf, y)).collect::<Vec<_>>().join("\n");
+
+        for needle in ["Meaningful", "@ada", "infra", "Elsewhere", "@bob", "security"] {
+            let cells = cells_of(&buf, needle)
+                .unwrap_or_else(|| panic!("{needle:?} never reached the screen:\n{}", dump()));
+            for (i, cell) in cells.iter().enumerate() {
+                assert!(
+                    !cell.modifier.contains(Modifier::DIM),
+                    "{needle:?} renders dim at offset {i}:\n{}",
+                    dump()
+                );
+            }
+        }
+
+        // And a tag keeps its own palette slot rather than collapsing to the
+        // default foreground, which is what made it distinguishable at all.
+        let infra = cells_of(&buf, "infra").unwrap();
+        let security = cells_of(&buf, "security").unwrap();
+        assert_ne!(infra[0].fg, ratatui::style::Color::Reset, "tag lost its colour");
+        assert_ne!(
+            infra[0].fg, security[0].fg,
+            "two different tags painted the same colour"
+        );
+    }
+
+    #[test]
+    fn compact_rows_in_an_unfocused_column_recede() {
+        // Compact has no border to carry focus, so the title does. Render two
+        // columns and read the titles' modifiers back off the screen.
+        let mut board = board_with("Backlog", 1);
+        board.columns[0].cards[0].title = "Focused".into();
+        board.columns.push(Column {
+            slug: "done".into(),
+            name: "Done".into(),
+            order: 1,
+            wip_limit: None,
+            hidden: false,
+            cards: vec![Card::new("0200".into(), "Elsewhere".into())],
+        });
+        let mut state = AppState::new();
+        state.compact = true;
+        let buf = render_to_buffer(&board, &state, 80, 10);
+
+        let dim_at = |needle: &str| {
+            for y in 0..10 {
+                let line = row(&buf, y);
+                if let Some(col) = line.find(needle) {
+                    return Some(buf[(col as u16, y)].modifier.contains(Modifier::DIM));
+                }
+            }
+            None
+        };
+        assert_eq!(
+            dim_at("Focused"),
+            Some(false),
+            "the focused column's row should not be dim"
+        );
+        assert_eq!(
+            dim_at("Elsewhere"),
+            Some(true),
+            "the unfocused column's row should recede"
+        );
+    }
+
+    #[test]
+    fn an_unfocused_fresh_card_border_renders_dim_on_screen() {
+        // The regression that started this: DIM became Color::Reset, so unfocused
+        // cards rendered at full brightness. Read the painted cell, not the helper.
+        let mut board = board_with("Backlog", 1);
+        board.columns.push(kando_core::board::Column {
+            slug: "done".into(),
+            name: "Done".into(),
+            order: 1,
+            wip_limit: None,
+            hidden: false,
+            cards: vec![Card::new("0200".into(), "Elsewhere".into())],
+        });
+        let state = AppState::new();
+        let buf = render_to_buffer(&board, &state, 80, 14);
+
+        // Find a border cell belonging to the second (unfocused) column.
+        let mut dim_seen = false;
+        for y in 2..14 {
+            for x in 40..80 {
+                let cell = &buf[(x, y)];
+                if matches!(cell.symbol(), "╭" | "╮" | "│" | "╰" | "╯") {
+                    assert!(
+                        cell.modifier.contains(Modifier::DIM),
+                        "unfocused card border at ({x},{y}) is not dim"
+                    );
+                    dim_seen = true;
+                }
+            }
+        }
+        assert!(dim_seen, "found no unfocused card border to check");
     }
 }

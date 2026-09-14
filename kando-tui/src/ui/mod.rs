@@ -6,7 +6,6 @@ pub mod metrics;
 pub mod status_bar;
 pub mod theme;
 
-
 use chrono::{DateTime, Utc};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::Frame;
@@ -37,24 +36,29 @@ pub fn centered_rect(area: Rect, w_pct: u16, h_pct: u16, min_w: u16, min_h: u16)
 
 /// Clear an overlay's area, draw its frame, and hand back the inner rect to
 /// write into. The border style, corner type and padding live here so the
-/// overlays cannot drift apart from each other.
+/// three full-panel overlays — help, card detail and metrics — cannot drift
+/// apart from each other. The `input_modal` popups are a different shape
+/// (small, transient, positioned by content) and deliberately do not use this.
 pub fn render_overlay_frame(
     f: &mut Frame,
     area: Rect,
+    bounds: Rect,
     title: ratatui::text::Line<'_>,
-    border_color: ratatui::style::Color,
+    border_style: ratatui::style::Style,
 ) -> Rect {
     use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding};
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(ratatui::style::Style::default().fg(border_color))
+        .border_style(border_style)
         .title(title)
         .padding(Padding::new(2, 2, 1, 1));
     let inner = block.inner(area);
     // Clear a cell beyond the frame as well, so board cards never sit flush
     // against the panel border and read as part of it.
-    f.render_widget(Clear, with_margin(area, f.area()));
+    // `bounds` is the region the overlay owns, not the whole screen: the ring
+    // must not reach past it and wipe the status bar underneath.
+    f.render_widget(Clear, with_margin(area, bounds));
     f.render_widget(block, area);
     inner
 }
@@ -109,14 +113,14 @@ pub fn render(f: &mut Frame, board: &Board, state: &mut AppState, now: DateTime<
             let nerd_font = state.nerd_font;
             if let Some(card) = board.columns.get(col_idx).and_then(|c| c.cards.get(card_idx)) {
                 let icons = theme::icons(nerd_font);
-                card_detail::render_card_detail(f, f.area(), card, &board.policies, scroll, now, icons);
+                card_detail::render_card_detail(f, chunks[0], card, &board.policies, scroll, now, icons);
             }
         }
         crate::app::Mode::Help { scroll, page } => {
-            help::render_help(f, f.area(), scroll, page);
+            help::render_help(f, chunks[0], scroll, page);
         }
         crate::app::Mode::Metrics { scroll } => {
-            metrics::render_metrics(f, f.area(), board, scroll, now, kando_dir);
+            metrics::render_metrics(f, chunks[0], board, scroll, now, kando_dir);
         }
         _ => {}
     }
@@ -130,6 +134,55 @@ pub fn render(f: &mut Frame, board: &Board, state: &mut AppState, now: DateTime<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kando_core::board::{Column, Policies};
+
+    fn help_board() -> Board {
+        Board {
+            name: "Kando Test Board".into(),
+            next_card_id: 100,
+            policies: Policies::default(),
+            sync_branch: None,
+            created_at: None,
+            nerd_font: false,
+            columns: vec![Column {
+                slug: "backlog".into(),
+                name: "Backlog".into(),
+                order: 0,
+                wip_limit: None,
+                hidden: false,
+                cards: vec![kando_core::Card::new("0100".into(), "Card".into())],
+            }],
+        }
+    }
+
+    /// The overlay's clear ring extends one cell past the panel. It used to be
+    /// clipped to the whole screen, so a full-height panel wiped the status bar
+    /// underneath it. Render the real frame and read the bottom row back.
+    #[test]
+    fn an_overlay_never_wipes_the_status_bar() {
+        let board = help_board();
+        for height in [20u16, 24, 25, 26, 40] {
+            let mut state = AppState::new();
+            state.mode = crate::app::Mode::Help {
+                scroll: 0,
+                page: crate::app::HelpPage::Keybindings,
+            };
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, height)).unwrap();
+            let now: DateTime<Utc> = "2026-01-15T12:00:00Z".parse().unwrap();
+            terminal
+                .draw(|f| {
+                    render(f, &board, &mut state, now, std::path::Path::new("/tmp/fake"))
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let bottom: String = (0..80).map(|x| buf[(x, height - 1)].symbol()).collect();
+            assert!(
+                bottom.contains("Kando Test Board"),
+                "h={height}: the help overlay's ring wiped the status bar: {bottom:?}"
+            );
+        }
+    }
 
     #[test]
     fn centered_rect_basic() {

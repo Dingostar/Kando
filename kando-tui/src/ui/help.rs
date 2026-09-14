@@ -11,7 +11,6 @@ use crate::input::keymap;
 pub fn render_help(f: &mut Frame, area: Rect, scroll: &mut u16, page: &HelpPage) {
     let panel_area = super::overlay_rect(area);
 
-
     let active = Style::default()
         .fg(Theme::FG)
         .add_modifier(Modifier::BOLD);
@@ -30,7 +29,7 @@ pub fn render_help(f: &mut Frame, area: Rect, scroll: &mut u16, page: &HelpPage)
         Span::raw(" "),
     ]);
 
-    let inner = super::render_overlay_frame(f, panel_area, title, Theme::FG);
+    let inner = super::render_overlay_frame(f, panel_area, area, title, Style::default().fg(Theme::FG));
 
     if inner.height == 0 {
         return;

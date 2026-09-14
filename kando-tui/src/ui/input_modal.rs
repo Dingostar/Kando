@@ -160,7 +160,11 @@ pub fn render_picker(
             let marker = if *is_active { "x " } else { "  " };
             spans.push(Span::styled(
                 marker,
-                Style::default().fg(if *is_active { Theme::FG } else { Theme::DIM }),
+                if *is_active {
+                    Style::default().fg(Theme::FG)
+                } else {
+                    Theme::dim_style()
+                },
             ));
         } else {
             spans.push(Span::raw("  "));

@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::theme::Theme;
@@ -12,22 +12,17 @@ use kando_core::board::Board;
 pub fn render_metrics(f: &mut Frame, area: Rect, board: &Board, scroll: &mut u16, _now: DateTime<Utc>, kando_dir: &std::path::Path) {
     let panel_area = super::overlay_rect(area);
 
-    f.render_widget(Clear, panel_area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(Theme::FG))
-        .title(Span::styled(
-            " Board Metrics ",
-            Style::default()
-                .fg(Theme::FG)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .padding(Padding::new(2, 2, 1, 1));
-
-    let inner = block.inner(panel_area);
-    f.render_widget(block, panel_area);
+    let title = Line::from(Span::styled(
+        " Board Metrics ",
+        Style::default().fg(Theme::FG).add_modifier(Modifier::BOLD),
+    ));
+    let inner = super::render_overlay_frame(
+        f,
+        panel_area,
+        area,
+        title,
+        Style::default().fg(Theme::FG),
+    );
 
     if inner.height == 0 || inner.width == 0 {
         return;
@@ -38,7 +33,7 @@ pub fn render_metrics(f: &mut Frame, area: Rect, board: &Board, scroll: &mut u16
     let heading = Style::default()
         .fg(Theme::FG)
         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-    let label = Style::default().fg(Theme::DIM);
+    let label = Theme::dim_style();
     let value = Style::default().fg(Theme::FG).add_modifier(Modifier::BOLD);
     let dim = Theme::dim_style();
 
@@ -112,12 +107,12 @@ pub fn render_metrics(f: &mut Frame, area: Rect, board: &Board, scroll: &mut u16
         let over_limit = entry
             .wip_limit
             .is_some_and(|l| entry.count as u32 >= l);
-        let color = if over_limit {
-            Theme::WIP_OVER
+        let style = if over_limit {
+            Style::default().fg(Theme::WIP_OVER)
         } else if entry.count == 0 {
-            Theme::DIM
+            Theme::dim_style()
         } else {
-            Theme::WIP_OK
+            Style::default().fg(Theme::WIP_OK)
         };
 
         let count_str = if let Some(limit) = entry.wip_limit {
@@ -130,7 +125,7 @@ pub fn render_metrics(f: &mut Frame, area: Rect, board: &Board, scroll: &mut u16
 
         lines.push(Line::from(vec![
             Span::styled(name_label, label),
-            Span::styled(bar_pad, Style::default().fg(color)),
+            Span::styled(bar_pad, style),
             Span::styled(count_str, if over_limit {
                 Style::default().fg(Theme::WIP_OVER).add_modifier(Modifier::BOLD)
             } else {
@@ -162,15 +157,15 @@ pub fn render_metrics(f: &mut Frame, area: Rect, board: &Board, scroll: &mut u16
             .max(if *count > 0 { 1 } else { 0 });
             let bar: String = "\u{2588}".repeat(bar_len);
             let bar_pad = format!("{:<width$}", bar, width = tp_bar_max);
-            let color = if *count == 0 {
-                Theme::DIM
+            let style = if *count == 0 {
+                Theme::dim_style()
             } else {
-                Theme::WIP_OK
+                Style::default().fg(Theme::WIP_OK)
             };
             let arrival = metrics.arrival_per_week.get(i).map_or(0, |(_, c)| *c);
             lines.push(Line::from(vec![
                 Span::styled(format!("  {:<10} ", week_label), label),
-                Span::styled(bar_pad, Style::default().fg(color)),
+                Span::styled(bar_pad, style),
                 Span::styled(format!(" {:>2}", count), value),
                 Span::styled(format!("  ({arrival} arrived)"), dim),
             ]));
@@ -289,12 +284,12 @@ pub fn render_metrics(f: &mut Frame, area: Rect, board: &Board, scroll: &mut u16
 
             let is_bottleneck =
                 entry.is_active && entry.median_days > 0.0 && entry.median_days >= max_active_median;
-            let color = if is_bottleneck {
-                Theme::STALE
+            let style = if is_bottleneck {
+                Style::default().fg(Theme::STALE)
             } else if !entry.is_active {
-                Theme::DIM
+                Theme::dim_style()
             } else {
-                Theme::WIP_OK
+                Style::default().fg(Theme::WIP_OK)
             };
 
             let name_label = format!("  {:<width$} ", entry.name, width = max_name_len);
@@ -307,7 +302,7 @@ pub fn render_metrics(f: &mut Frame, area: Rect, board: &Board, scroll: &mut u16
 
             lines.push(Line::from(vec![
                 Span::styled(name_label, if !entry.is_active { dim } else { label }),
-                Span::styled(bar_pad, Style::default().fg(color)),
+                Span::styled(bar_pad, style),
                 Span::styled(stats_str, entry_style),
             ]));
         }

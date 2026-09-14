@@ -122,7 +122,7 @@ fn build_right_zone<'a>(state: &'a AppState, board_name: &'a str) -> Vec<Span<'a
     // Board name
     spans.push(Span::styled(
         board_name,
-        Style::default().fg(Theme::DIM),
+        Theme::dim_style(),
     ));
 
     // Sync status (at far right edge)
@@ -173,7 +173,7 @@ fn build_center_zone<'a>(state: &'a AppState, avail_width: usize) -> Vec<Span<'a
             let pad_right = pad_total - pad_left;
             return vec![
                 Span::raw(" ".repeat(pad_left)),
-                Span::styled(prefix, Style::default().fg(Theme::DIM)),
+                Span::styled(prefix, Theme::dim_style()),
                 Span::styled(notif.as_str(), Style::default().fg(color)),
                 Span::raw(" ".repeat(pad_right)),
             ];
@@ -382,7 +382,9 @@ mod tests {
         let state = AppState::new();
         let spans = build_right_zone(&state, "my-project");
         assert_eq!(spans[0].content.as_ref(), "my-project");
-        assert_eq!(spans[0].style.fg, Some(Theme::DIM));
+        // Secondary text recedes by modifier; comparing the colour alone would
+        // pass against any foreground.
+        assert_eq!(spans[0].style, Theme::dim_style());
     }
 
     #[test]
