@@ -37,6 +37,9 @@ pub fn map_key(key: KeyEvent, mode: &Mode) -> Action {
             KeyCode::Char('|') => Action::PipeCard,
             KeyCode::Char('j') | KeyCode::Down => Action::DetailScrollDown,
             KeyCode::Char('k') | KeyCode::Up => Action::DetailScrollUp,
+            KeyCode::Char('i') => Action::ToggleDetailImage,
+            KeyCode::Char('n') => Action::DetailNextImage,
+            KeyCode::Char('p') => Action::DetailPrevImage,
             KeyCode::Tab => Action::DetailNextCard,
             KeyCode::BackTab => Action::DetailPrevCard,
             _ => Action::None,
@@ -313,6 +316,8 @@ pub const DETAIL_BINDINGS: &[Binding] = &[
     Binding { key: "Tab/S-Tab", description: "Next/prev card" },
     Binding { key: "e", description: "Edit in $EDITOR" },
     Binding { key: "|", description: "Pipe card to command" },
+    Binding { key: "i", description: "Show / hide image" },
+    Binding { key: "n / p", description: "Next/prev image" },
     Binding { key: "Esc", description: "Close" },
 ];
 
@@ -899,9 +904,25 @@ mod tests {
     }
 
     #[test]
-    fn detail_p_is_noop() {
+    fn detail_i_toggles_the_image() {
         let mode = Mode::CardDetail { scroll: 0 };
-        assert_eq!(map_key(key(KeyCode::Char('p')), &mode), Action::None);
+        assert_eq!(
+            map_key(key(KeyCode::Char('i')), &mode),
+            Action::ToggleDetailImage
+        );
+    }
+
+    #[test]
+    fn detail_n_and_p_step_through_images() {
+        let mode = Mode::CardDetail { scroll: 0 };
+        assert_eq!(
+            map_key(key(KeyCode::Char('n')), &mode),
+            Action::DetailNextImage
+        );
+        assert_eq!(
+            map_key(key(KeyCode::Char('p')), &mode),
+            Action::DetailPrevImage
+        );
     }
 
     #[test]

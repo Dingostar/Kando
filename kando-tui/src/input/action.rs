@@ -38,6 +38,9 @@ pub enum Action {
     DetailScrollDown,
     DetailNextCard,
     DetailPrevCard,
+    ToggleDetailImage,
+    DetailNextImage,
+    DetailPrevImage,
 
     // Column mode
     ToggleHiddenColumns,

@@ -1,5 +1,6 @@
 pub mod board_view;
 pub mod card_detail;
+pub mod card_image;
 pub mod help;
 pub mod input_modal;
 pub mod metrics;
@@ -111,9 +112,23 @@ pub fn render(f: &mut Frame, board: &Board, state: &mut AppState, now: DateTime<
             let col_idx = state.focused_column;
             let card_idx = state.selected_card;
             let nerd_font = state.nerd_font;
-            if let Some(card) = board.columns.get(col_idx).and_then(|c| c.cards.get(card_idx)) {
-                let icons = theme::icons(nerd_font);
-                card_detail::render_card_detail(f, chunks[0], card, &board.policies, scroll, now, icons);
+            if let Some(column) = board.columns.get(col_idx) {
+                if let Some(card) = column.cards.get(card_idx) {
+                    let mut view = card_detail::DetailView {
+                        card,
+                        policies: &board.policies,
+                        now,
+                        icons: theme::icons(nerd_font),
+                        image: card_image::ImagePane {
+                            images: state.images.as_mut(),
+                            kando_dir,
+                            column_slug: &column.slug,
+                            index: state.detail_image,
+                            collapsed: state.detail_image_collapsed,
+                        },
+                    };
+                    card_detail::render_card_detail(f, chunks[0], scroll, &mut view);
+                }
             }
         }
         crate::app::Mode::Help { scroll, page } => {

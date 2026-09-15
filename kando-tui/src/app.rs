@@ -335,6 +335,13 @@ pub struct AppState {
     pub notification_is_hook: bool,
     /// Board reload deferred because a hook completed while not in Normal mode.
     pub pending_hook_reload: bool,
+    /// Terminal graphics support plus the decoded card image, if the terminal
+    /// answered our capability query. `None` means no image rendering.
+    pub images: Option<crate::ui::card_image::CardImages>,
+    /// Which of the open card's images the detail pane is showing.
+    pub detail_image: usize,
+    /// Detail pane is showing text full height, image hidden (`i`).
+    pub detail_image_collapsed: bool,
 }
 
 impl AppState {
@@ -366,6 +373,9 @@ impl AppState {
             hook_rx: None,
             notification_is_hook: false,
             pending_hook_reload: false,
+            images: None,
+            detail_image: 0,
+            detail_image_collapsed: false,
         }
     }
 
@@ -796,6 +806,12 @@ pub fn run(terminal: &mut DefaultTerminal, start_dir: &std::path::Path, nerd_fon
     let mut board = load_board(kando_dir)?;
     let mut state = AppState::new();
 
+    // Ask the terminal which graphics protocol it speaks and how big a cell is.
+    // This writes to and reads from stdio, so it has to happen after the
+    // alternate screen is up but before we start reading events, or the reply
+    // would land in the event stream. `None` means no image rendering.
+    state.images = crate::ui::card_image::CardImages::query();
+
     if let Some((ss, pulled)) = initial_sync_state {
         state.sync_state = Some(ss);
         if pulled {
@@ -1006,7 +1022,10 @@ fn process_action(
         | Action::DetailScrollDown
         | Action::DetailScrollUp
         | Action::DetailNextCard
-        | Action::DetailPrevCard => {
+        | Action::DetailPrevCard
+        | Action::ToggleDetailImage
+        | Action::DetailNextImage
+        | Action::DetailPrevImage => {
             sync_message = handle_card_action(board, state, action, terminal, kando_dir, was_minor_mode)?;
         }
 
@@ -1845,6 +1864,23 @@ fn handle_goto(board: &Board, state: &mut AppState, action: Action) {
     }
 }
 
+/// Move to the next/previous image on the open card, wrapping around.
+fn step_detail_image(board: &Board, state: &mut AppState, delta: isize) {
+    let count = state
+        .selected_card_ref(board)
+        .map_or(0, |card| crate::ui::card_image::image_refs(&card.body).len());
+
+    match count {
+        0 => state.notify("No images on this card"),
+        1 => state.notify("Only one image on this card"),
+        n => {
+            let current = (state.detail_image % n) as isize;
+            state.detail_image = (current + delta).rem_euclid(n as isize) as usize;
+            state.detail_image_collapsed = false;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handler: Card actions (CRUD, priority, tags, movement, detail view)
 // ---------------------------------------------------------------------------
@@ -1865,6 +1901,7 @@ where
     // Clear undo state on any card-mutating action (except delete itself, which sets it).
     if !matches!(action, Action::DeleteCard | Action::OpenCardDetail | Action::ClosePanel
         | Action::DetailScrollDown | Action::DetailScrollUp | Action::DetailNextCard | Action::DetailPrevCard
+        | Action::ToggleDetailImage | Action::DetailNextImage | Action::DetailPrevImage
         | Action::PipeCard) {
         state.last_delete = None;
         state.deleted_this_session = false;
@@ -1881,6 +1918,9 @@ where
             | Action::DetailScrollUp
             | Action::DetailNextCard
             | Action::DetailPrevCard
+            | Action::ToggleDetailImage
+            | Action::DetailNextImage
+            | Action::DetailPrevImage
     );
     if needs_visible_card && state.has_active_filter() {
         if let Some(col) = board.columns.get(state.focused_column) {
@@ -2169,7 +2209,17 @@ where
         Action::OpenCardDetail => {
             if state.selected_card_ref(board).is_some() {
                 state.mode = Mode::CardDetail { scroll: 0 };
+                state.detail_image = 0;
             }
+        }
+        Action::ToggleDetailImage => {
+            state.detail_image_collapsed = !state.detail_image_collapsed;
+        }
+        Action::DetailNextImage => {
+            step_detail_image(board, state, 1);
+        }
+        Action::DetailPrevImage => {
+            step_detail_image(board, state, -1);
         }
         Action::ClosePanel => {
             state.mode = Mode::Normal;
@@ -2197,6 +2247,7 @@ where
                     if pos + 1 < visible.len() {
                         state.selected_card = visible[pos + 1];
                         state.mode = Mode::CardDetail { scroll: 0 };
+                        state.detail_image = 0;
                     } else {
                         state.notify("Last card");
                     }
@@ -2210,6 +2261,7 @@ where
                     if pos > 0 {
                         state.selected_card = visible[pos - 1];
                         state.mode = Mode::CardDetail { scroll: 0 };
+                        state.detail_image = 0;
                     } else {
                         state.notify("First card");
                     }

@@ -6,14 +6,30 @@ use ratatui::widgets::{
     Wrap,
 };
 use ratatui::Frame;
+use ratatui_image::StatefulImage;
 
 use super::board_view::card_border_style;
+use super::card_image::{self, ImagePane};
 use super::theme::{Icons, Theme};
 use kando_core::board::age::{format_age, staleness};
 use kando_core::board::{Card, Policies};
 use chrono::{DateTime, Utc};
 
-pub fn render_card_detail(f: &mut Frame, area: Rect, card: &Card, policies: &Policies, scroll: &mut u16, now: DateTime<Utc>, icons: &Icons) {
+/// Everything the detail pane needs, gathered into one value so the render
+/// signature stays readable.
+pub struct DetailView<'a> {
+    pub card: &'a Card,
+    pub policies: &'a Policies,
+    pub now: DateTime<Utc>,
+    pub icons: &'a Icons,
+    pub image: ImagePane<'a>,
+}
+
+pub fn render_card_detail(f: &mut Frame, area: Rect, scroll: &mut u16, view: &mut DetailView<'_>) {
+    let card = view.card;
+    let policies = view.policies;
+    let now = view.now;
+    let icons = view.icons;
 
     let panel_area = super::overlay_rect(area);
 
@@ -172,14 +188,21 @@ pub fn render_card_detail(f: &mut Frame, area: Rect, card: &Card, policies: &Pol
         }
     }
 
+    let refs = card_image::image_refs(&card.body);
+    let (text_area, image_area) = split_for_image(inner, &refs, &view.image);
+
     let line_count = lines.len();
-    let max_scroll = (line_count as u16).saturating_sub(inner.height);
+    let max_scroll = (line_count as u16).saturating_sub(text_area.height);
     *scroll = (*scroll).min(max_scroll);
 
     let paragraph = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((*scroll, 0));
-    f.render_widget(paragraph, inner);
+    f.render_widget(paragraph, text_area);
+
+    if let Some(image_area) = image_area {
+        render_image(f, image_area, &refs, &mut view.image);
+    }
 
     // Scrollbar
     if max_scroll > 0 {
@@ -197,5 +220,223 @@ pub fn render_card_detail(f: &mut Frame, area: Rect, card: &Card, policies: &Pol
             horizontal: 0,
         });
         f.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+    }
+}
+
+/// Bottom slice of the detail pane reserved for the image.
+///
+/// Returns the whole pane for text when there is nothing to show, when the user
+/// collapsed the image with `i`, or when the pane is too short to split without
+/// squeezing the text into uselessness.
+fn split_for_image(inner: Rect, refs: &[String], pane: &ImagePane<'_>) -> (Rect, Option<Rect>) {
+    const MIN_IMAGE_HEIGHT: u16 = 7;
+    const MIN_TEXT_HEIGHT: u16 = 7;
+
+    if refs.is_empty() || pane.collapsed || inner.height < MIN_IMAGE_HEIGHT + MIN_TEXT_HEIGHT {
+        return (inner, None);
+    }
+
+    let image_height = inner.height / 2;
+    let text_height = inner.height - image_height;
+    (
+        Rect::new(inner.x, inner.y, inner.width, text_height),
+        Some(Rect::new(
+            inner.x,
+            inner.y + text_height,
+            inner.width,
+            image_height,
+        )),
+    )
+}
+
+/// Draw the selected image with a caption line under it. Anything that goes
+/// wrong — unresolvable path, undecodable file, a terminal without graphics
+/// support — is reported in the caption rather than hidden.
+fn render_image(f: &mut Frame, area: Rect, refs: &[String], pane: &mut ImagePane<'_>) {
+    if area.height < 2 || refs.is_empty() {
+        return;
+    }
+
+    let index = pane.index % refs.len();
+    let reference = refs[index].as_str();
+    let resolved = card_image::resolve_image(pane.kando_dir, pane.column_slug, reference);
+    let name = resolved
+        .as_deref()
+        .map_or_else(|| reference.to_string(), card_image::short_name);
+
+    let picture_area = Rect::new(area.x, area.y, area.width, area.height - 1);
+    let caption_area = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+
+    let problem = match (resolved.as_deref(), pane.images.as_mut()) {
+        (None, _) => Some(format!("not found: {reference}")),
+        (Some(_), None) => Some("this terminal cannot display images".to_string()),
+        (Some(path), Some(images)) => match images.protocol_for(path) {
+            Ok(protocol) => {
+                f.render_stateful_widget(StatefulImage::default(), picture_area, protocol);
+                None
+            }
+            Err(e) => Some(e),
+        },
+    };
+
+    let mut spans = Vec::new();
+    if refs.len() > 1 {
+        spans.push(Span::styled(
+            format!("{}/{}  ", index + 1, refs.len()),
+            Theme::dim_style(),
+        ));
+    }
+    match &problem {
+        Some(msg) => spans.push(Span::styled(
+            msg.clone(),
+            Style::default().fg(Theme::OVERDUE),
+        )),
+        None => spans.push(Span::styled(name, Theme::dim_style())),
+    }
+    spans.push(Span::styled(
+        if refs.len() > 1 {
+            "   i hide · n/p next"
+        } else {
+            "   i hide"
+        },
+        Theme::dim_style(),
+    ));
+
+    f.render_widget(Paragraph::new(Line::from(spans)), caption_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::card_image::ImagePane;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::path::Path;
+
+    fn pane<'a>(kando_dir: &'a Path, collapsed: bool) -> ImagePane<'a> {
+        ImagePane {
+            images: None,
+            kando_dir,
+            column_slug: "in-progress",
+            index: 0,
+            collapsed,
+        }
+    }
+
+    #[test]
+    fn a_card_without_images_keeps_the_whole_pane_for_text() {
+        let dir = Path::new("/tmp/fake/.kando");
+        let inner = Rect::new(0, 0, 60, 30);
+        let (text, image) = split_for_image(inner, &[], &pane(dir, false));
+        assert_eq!(text, inner);
+        assert!(image.is_none());
+    }
+
+    #[test]
+    fn collapsing_gives_the_pane_back_to_the_text() {
+        let dir = Path::new("/tmp/fake/.kando");
+        let inner = Rect::new(0, 0, 60, 30);
+        let refs = vec!["a.png".to_string()];
+        let (text, image) = split_for_image(inner, &refs, &pane(dir, true));
+        assert_eq!(text, inner);
+        assert!(image.is_none());
+    }
+
+    #[test]
+    fn a_short_pane_is_not_split() {
+        let dir = Path::new("/tmp/fake/.kando");
+        let refs = vec!["a.png".to_string()];
+        for height in [1u16, 7, 13] {
+            let inner = Rect::new(0, 0, 60, height);
+            let (text, image) = split_for_image(inner, &refs, &pane(dir, false));
+            assert_eq!(text, inner, "h={height}");
+            assert!(image.is_none(), "h={height}");
+        }
+    }
+
+    #[test]
+    fn splitting_covers_the_pane_exactly_and_leaves_room_to_read() {
+        let dir = Path::new("/tmp/fake/.kando");
+        let refs = vec!["a.png".to_string()];
+        for height in [14u16, 15, 30, 61] {
+            let inner = Rect::new(3, 5, 60, height);
+            let (text, image) = split_for_image(inner, &refs, &pane(dir, false));
+            let image = image.expect("tall enough to split");
+
+            assert_eq!(text.y, inner.y, "h={height}");
+            assert_eq!(text.bottom(), image.y, "h={height}: no gap or overlap");
+            assert_eq!(image.bottom(), inner.bottom(), "h={height}");
+            assert!(text.height >= 7, "h={height}: text squeezed to {}", text.height);
+            assert!(image.height >= 7, "h={height}: image squeezed to {}", image.height);
+        }
+    }
+
+    fn render_body(body: &str, kando_dir: &Path) -> String {
+        let mut card = kando_core::Card::new("1".into(), "Learn kanban".into());
+        card.body = body.to_string();
+        let policies = Policies::default();
+        let icons = crate::ui::theme::icons(false);
+        let now: DateTime<Utc> = "2026-01-15T12:00:00Z".parse().unwrap();
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
+        let mut scroll = 0;
+        terminal
+            .draw(|f| {
+                let mut view = DetailView {
+                    card: &card,
+                    policies: &policies,
+                    now,
+                    icons,
+                    image: pane(kando_dir, false),
+                };
+                render_card_detail(f, f.area(), &mut scroll, &mut view);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        (0..40)
+            .map(|y| (0..80).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Without terminal graphics support the pane must say so rather than
+    /// silently leaving a hole where the picture should be.
+    #[test]
+    fn a_terminal_without_graphics_support_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kando_dir = tmp.path().join(".kando");
+        std::fs::create_dir_all(kando_dir.join("assets")).unwrap();
+        std::fs::write(kando_dir.join("assets/shot.png"), b"not really a png").unwrap();
+
+        let screen = render_body("![shot](shot.png)", &kando_dir);
+        assert!(
+            screen.contains("cannot display images"),
+            "expected a caption explaining the missing image:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_reference_is_reported_in_the_caption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kando_dir = tmp.path().join(".kando");
+        std::fs::create_dir_all(&kando_dir).unwrap();
+
+        let screen = render_body("![gone](nope.png)", &kando_dir);
+        assert!(
+            screen.contains("not found: nope.png"),
+            "expected the caption to name the missing file:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn a_card_without_images_renders_no_caption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kando_dir = tmp.path().join(".kando");
+        std::fs::create_dir_all(&kando_dir).unwrap();
+
+        let screen = render_body("Just some notes.", &kando_dir);
+        assert!(screen.contains("Just some notes."));
+        assert!(!screen.contains("i hide"), "no image, so no image caption:\n{screen}");
     }
 }
