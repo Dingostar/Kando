@@ -16,14 +16,29 @@ struct PopupEntry {
 }
 
 /// Render the minor-mode hint popup (shown for g, gc, space, c, cm, f modes).
-pub fn render_hint_popup(f: &mut Frame, area: Rect, mode: &Mode, board: &Board) {
+pub fn render_hint_popup(f: &mut Frame, area: Rect, mode: &Mode, board: &Board, keys: &crate::input::keys::KeyConfig) {
     // Build entries: for GotoColumn, combine static bindings with dynamic column letters.
+    let bind_mode = crate::input::keys::BindMode::of(mode);
+    let resolve = |b: &keymap::Binding| PopupEntry {
+        key: match bind_mode {
+            Some(bm) => keymap::effective_key(b.key, bm, keys),
+            None => b.key.to_string(),
+        },
+        desc: b.description.to_string(),
+    };
+    let added = || -> Vec<PopupEntry> {
+        bind_mode
+            .map(|bm| keymap::added_bindings(bm, keys))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(key, desc)| PopupEntry { key, desc })
+            .collect()
+    };
+
     let entries: Vec<PopupEntry> = if matches!(mode, Mode::GotoColumn) {
         let static_bindings = keymap::mode_bindings(mode);
-        let mut entries: Vec<PopupEntry> = static_bindings
-            .iter()
-            .map(|b| PopupEntry { key: b.key.to_string(), desc: b.description.to_string() })
-            .collect();
+        let mut entries: Vec<PopupEntry> = static_bindings.iter().map(resolve).collect();
+        entries.extend(added());
         let letters = app::assign_column_letters(board, true);
         for (col_idx, ch) in letters {
             if let Some(col) = board.columns.get(col_idx) {
@@ -39,10 +54,9 @@ pub fn render_hint_popup(f: &mut Frame, area: Rect, mode: &Mode, board: &Board) 
         if bindings.is_empty() {
             return;
         }
-        bindings
-            .iter()
-            .map(|b| PopupEntry { key: b.key.to_string(), desc: b.description.to_string() })
-            .collect()
+        let mut entries: Vec<PopupEntry> = bindings.iter().map(resolve).collect();
+        entries.extend(added());
+        entries
     };
 
     if entries.is_empty() {

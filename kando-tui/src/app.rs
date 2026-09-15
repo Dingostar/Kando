@@ -12,7 +12,8 @@ use kando_core::config::LocalConfig;
 use kando_core::board::sync::{self, SyncState};
 use kando_core::board::{Board, Card, Column};
 use crate::input::action::Action;
-use crate::input::keymap::map_key;
+use crate::input::keymap::map_key_with;
+use crate::input::keys::KeyConfig;
 
 /// Reusable text editing buffer with cursor.
 ///
@@ -342,6 +343,8 @@ pub struct AppState {
     pub detail_image: usize,
     /// Detail pane is showing text full height, image hidden (`i`).
     pub detail_image_collapsed: bool,
+    /// Keybinding overrides from ~/.config/kando/keys.toml.
+    pub keys: KeyConfig,
 }
 
 impl AppState {
@@ -376,6 +379,7 @@ impl AppState {
             images: None,
             detail_image: 0,
             detail_image_collapsed: false,
+            keys: KeyConfig::default(),
         }
     }
 
@@ -806,6 +810,14 @@ pub fn run(terminal: &mut DefaultTerminal, start_dir: &std::path::Path, nerd_fon
     let mut board = load_board(kando_dir)?;
     let mut state = AppState::new();
 
+    // A broken keymap must not stop a board from opening: fall back to the
+    // defaults and tell the user which line to fix.
+    let (keys, keys_error) = KeyConfig::load();
+    state.keys = keys;
+    if let Some(e) = keys_error {
+        state.notify_error(e);
+    }
+
     // Ask the terminal which graphics protocol it speaks and how big a cell is.
     // This writes to and reads from stdio, so it has to happen after the
     // alternate screen is up but before we start reading events, or the reply
@@ -946,7 +958,7 @@ pub fn run(terminal: &mut DefaultTerminal, start_dir: &std::path::Path, nerd_fon
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) => {
-                    let action = map_key(key, &state.mode);
+                    let action = map_key_with(key, &state.mode, &state.keys);
                     process_action(&mut board, &mut state, action, terminal, &ctx)?;
 
                     if state.should_quit {

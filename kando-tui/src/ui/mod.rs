@@ -103,7 +103,7 @@ pub fn render(f: &mut Frame, board: &Board, state: &mut AppState, now: DateTime<
     // Overlays
     match &mut state.mode {
         crate::app::Mode::Goto | crate::app::Mode::GotoColumn | crate::app::Mode::Space | crate::app::Mode::Column | crate::app::Mode::ColMove | crate::app::Mode::FilterMenu | crate::app::Mode::Template => {
-            input_modal::render_hint_popup(f, chunks[0], &state.mode, board);
+            input_modal::render_hint_popup(f, chunks[0], &state.mode, board, &state.keys);
         }
         crate::app::Mode::Picker { title, items, selected, .. } => {
             input_modal::render_picker(f, chunks[0], title, items, *selected);
@@ -132,7 +132,7 @@ pub fn render(f: &mut Frame, board: &Board, state: &mut AppState, now: DateTime<
             }
         }
         crate::app::Mode::Help { scroll, page } => {
-            help::render_help(f, chunks[0], scroll, page);
+            help::render_help(f, chunks[0], scroll, page, &state.keys);
         }
         crate::app::Mode::Metrics { scroll } => {
             metrics::render_metrics(f, chunks[0], board, scroll, now, kando_dir);

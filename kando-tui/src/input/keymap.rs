@@ -1,7 +1,92 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::action::Action;
+use super::keys::{BindMode, KeyConfig};
 use crate::app::Mode;
+
+/// Map a key event to an action, honouring the user's keymap overrides.
+pub fn map_key_with(key: KeyEvent, mode: &Mode, keys: &KeyConfig) -> Action {
+    if let Some(bind_mode) = BindMode::of(mode) {
+        if let Some(action) = keys.lookup(bind_mode, key.code, key.modifiers) {
+            return action.clone().unwrap_or(Action::None);
+        }
+    }
+    map_key(key, mode)
+}
+
+/// How a binding is spelled once the user's overrides are applied.
+///
+/// Display strings can name more than one key (`"j / k"`, `"Tab/S-Tab"`), so
+/// each part is resolved separately and the original separator kept. Parts that
+/// aren't a single key (`"1-9"`) are left alone.
+pub fn effective_key(display: &str, bind_mode: BindMode, keys: &KeyConfig) -> String {
+    if keys.is_empty() || display.trim().is_empty() {
+        return display.to_string();
+    }
+    let mode = bind_mode.to_mode();
+
+    let spaced = display.contains(" / ");
+    let resolved: Vec<String> = display
+        .split('/')
+        .map(|part| {
+            let trimmed = part.trim();
+            let Some(code) = crate::input::keys::parse_key(trimmed) else {
+                return trimmed.to_string();
+            };
+            let default_action = map_key(KeyEvent::new(code, KeyModifiers::NONE), &mode);
+            match keys.key_for(bind_mode, &default_action) {
+                Some(rebound) => crate::input::keys::key_name(rebound),
+                None => trimmed.to_string(),
+            }
+        })
+        .collect();
+
+    resolved.join(if spaced { " / " } else { "/" })
+}
+
+/// Keys the user bound to actions the built-in keymap doesn't reach in this
+/// mode — new bindings rather than replacements. Returned as (key, description)
+/// so help and the minor-mode popup can list them alongside the defaults.
+pub fn added_bindings(bind_mode: BindMode, keys: &KeyConfig) -> Vec<(String, String)> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let mode = bind_mode.to_mode();
+
+    keys.bindings_for(bind_mode)
+        .into_iter()
+        .filter(|(_, action, _)| !default_keymap_reaches(&mode, action))
+        .map(|(key, _, name)| (crate::input::keys::key_name(key), humanize(name)))
+        .collect()
+}
+
+/// Does any unmodified key produce `action` in this mode by default?
+fn default_keymap_reaches(mode: &Mode, action: &Action) -> bool {
+    let printable = (b' '..=b'~').map(|b| KeyCode::Char(b as char));
+    let named = [
+        KeyCode::Enter,
+        KeyCode::Tab,
+        KeyCode::BackTab,
+        KeyCode::Esc,
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::Left,
+        KeyCode::Right,
+    ];
+    printable
+        .chain(named)
+        .any(|code| &map_key(KeyEvent::new(code, KeyModifiers::NONE), mode) == action)
+}
+
+/// "find_next" -> "Find next"
+fn humanize(action_name: &str) -> String {
+    let spaced = action_name.replace('_', " ");
+    let mut chars = spaced.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => spaced,
+    }
+}
 
 /// Map a key event to a semantic action based on current mode.
 pub fn map_key(key: KeyEvent, mode: &Mode) -> Action {
@@ -228,6 +313,8 @@ pub struct Binding {
 /// A group of related bindings (one section in help overlay).
 pub struct BindingGroup {
     pub name: &'static str,
+    /// Which mode these keys belong to, so help can show the user's overrides.
+    pub mode: BindMode,
     pub bindings: &'static [Binding],
 }
 
@@ -323,15 +410,15 @@ pub const DETAIL_BINDINGS: &[Binding] = &[
 
 /// All binding groups for the help overlay.
 pub const HELP_GROUPS: &[BindingGroup] = &[
-    BindingGroup { name: "Normal Mode", bindings: NORMAL_BINDINGS },
-    BindingGroup { name: "Commands (Space)", bindings: SPACE_BINDINGS },
-    BindingGroup { name: "Goto (g)", bindings: GOTO_BINDINGS },
-    BindingGroup { name: "Goto Column (gc)", bindings: GOTO_COLUMN_BINDINGS },
-    BindingGroup { name: "Filter (f)", bindings: FILTER_BINDINGS },
-    BindingGroup { name: "Column (c)", bindings: COLUMN_BINDINGS },
-    BindingGroup { name: "Column Move (cm)", bindings: COL_MOVE_BINDINGS },
-    BindingGroup { name: "Template (t)", bindings: TEMPLATE_BINDINGS },
-    BindingGroup { name: "Card Detail", bindings: DETAIL_BINDINGS },
+    BindingGroup { name: "Normal Mode", mode: BindMode::Normal, bindings: NORMAL_BINDINGS },
+    BindingGroup { name: "Commands (Space)", mode: BindMode::Space, bindings: SPACE_BINDINGS },
+    BindingGroup { name: "Goto (g)", mode: BindMode::Goto, bindings: GOTO_BINDINGS },
+    BindingGroup { name: "Goto Column (gc)", mode: BindMode::GotoColumn, bindings: GOTO_COLUMN_BINDINGS },
+    BindingGroup { name: "Filter (f)", mode: BindMode::Filter, bindings: FILTER_BINDINGS },
+    BindingGroup { name: "Column (c)", mode: BindMode::Column, bindings: COLUMN_BINDINGS },
+    BindingGroup { name: "Column Move (cm)", mode: BindMode::ColMove, bindings: COL_MOVE_BINDINGS },
+    BindingGroup { name: "Template (t)", mode: BindMode::Template, bindings: TEMPLATE_BINDINGS },
+    BindingGroup { name: "Card Detail", mode: BindMode::Detail, bindings: DETAIL_BINDINGS },
 ];
 
 /// Get bindings for a minor mode (for popup and status display).
@@ -929,6 +1016,110 @@ mod tests {
     fn detail_b_is_noop() {
         let mode = Mode::CardDetail { scroll: 0 };
         assert_eq!(map_key(key(KeyCode::Char('b')), &mode), Action::None);
+    }
+
+    // ── User keymap overrides ──
+
+    fn nvim_style() -> KeyConfig {
+        KeyConfig::parse(
+            r#"
+            [normal]
+            b = "find_next"
+            B = "find_prev"
+            S = "start_sort"
+            s = "none"
+
+            [space]
+            q = "quit"
+            "#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn overrides_replace_default_bindings() {
+        let keys = nvim_style();
+        assert_eq!(
+            map_key_with(key(KeyCode::Char('b')), &Mode::Normal, &keys),
+            Action::FindNext
+        );
+        assert_eq!(
+            map_key_with(key(KeyCode::Char('S')), &Mode::Normal, &keys),
+            Action::StartSort
+        );
+        assert_eq!(
+            map_key_with(key(KeyCode::Char('q')), &Mode::Space, &keys),
+            Action::Quit
+        );
+    }
+
+    #[test]
+    fn unbinding_a_key_makes_it_do_nothing() {
+        let keys = nvim_style();
+        assert_eq!(map_key(key(KeyCode::Char('s')), &Mode::Normal), Action::StartSort);
+        assert_eq!(
+            map_key_with(key(KeyCode::Char('s')), &Mode::Normal, &keys),
+            Action::None
+        );
+    }
+
+    #[test]
+    fn keys_the_user_did_not_touch_keep_working() {
+        let keys = nvim_style();
+        for (code, expected) in [
+            (KeyCode::Char('j'), Action::SelectNextCard),
+            (KeyCode::Char('q'), Action::Quit),
+            (KeyCode::Char('n'), Action::FindNext),
+            (KeyCode::Enter, Action::OpenCardDetail),
+        ] {
+            assert_eq!(map_key_with(key(code), &Mode::Normal, &keys), expected);
+        }
+    }
+
+    #[test]
+    fn text_entry_modes_are_never_rebound() {
+        let keys = nvim_style();
+        let mode = Mode::Input {
+            prompt: "Title",
+            buf: crate::app::TextBuffer::new(String::new()),
+            on_confirm: crate::app::InputTarget::NewCardTitle,
+            completion: None,
+        };
+        // `b` must still type a b, not jump to the next match.
+        assert_eq!(
+            map_key_with(key(KeyCode::Char('b')), &mode, &keys),
+            Action::InputChar('b')
+        );
+    }
+
+    #[test]
+    fn help_shows_the_users_keys_not_the_defaults() {
+        let keys = nvim_style();
+        assert_eq!(effective_key("n / N", BindMode::Normal, &keys), "b / B");
+        assert_eq!(effective_key("s", BindMode::Normal, &keys), "S");
+        // Untouched bindings and unparseable labels are left alone.
+        assert_eq!(effective_key("j / k", BindMode::Normal, &keys), "j / k");
+        assert_eq!(effective_key("1-9", BindMode::ColMove, &keys), "1-9");
+        assert_eq!(effective_key("Tab/S-Tab", BindMode::Normal, &keys), "Tab/S-Tab");
+    }
+
+    #[test]
+    fn defaults_are_shown_verbatim_when_nothing_is_overridden() {
+        let keys = KeyConfig::default();
+        assert_eq!(effective_key("n / N", BindMode::Normal, &keys), "n / N");
+    }
+
+    #[test]
+    fn brand_new_bindings_are_listed_in_help() {
+        let keys = nvim_style();
+        // Space had no quit binding, so it shows up as an addition.
+        assert_eq!(
+            added_bindings(BindMode::Space, &keys),
+            vec![("q".to_string(), "Quit".to_string())]
+        );
+        // b/B/S only move existing actions to other keys, so they are not
+        // additions — effective_key already renamed them in place.
+        assert!(added_bindings(BindMode::Normal, &keys).is_empty());
     }
 
     // ── Binding registry tests ──

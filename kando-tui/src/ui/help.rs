@@ -8,7 +8,7 @@ use super::theme::Theme;
 use crate::app::HelpPage;
 use crate::input::keymap;
 
-pub fn render_help(f: &mut Frame, area: Rect, scroll: &mut u16, page: &HelpPage) {
+pub fn render_help(f: &mut Frame, area: Rect, scroll: &mut u16, page: &HelpPage, keys: &crate::input::keys::KeyConfig) {
     let panel_area = super::overlay_rect(area);
 
     let active = Style::default()
@@ -47,7 +47,7 @@ pub fn render_help(f: &mut Frame, area: Rect, scroll: &mut u16, page: &HelpPage)
     ];
 
     match page {
-        HelpPage::Keybindings => build_keybindings(&mut lines, key, dim),
+        HelpPage::Keybindings => build_keybindings(&mut lines, key, dim, keys),
         HelpPage::Concepts => build_concepts(&mut lines, key, dim),
     }
 
@@ -60,7 +60,7 @@ pub fn render_help(f: &mut Frame, area: Rect, scroll: &mut u16, page: &HelpPage)
     f.render_widget(paragraph, inner);
 }
 
-fn build_keybindings(lines: &mut Vec<Line<'static>>, key: Style, dim: Style) {
+fn build_keybindings(lines: &mut Vec<Line<'static>>, key: Style, dim: Style, keys: &crate::input::keys::KeyConfig) {
     let heading = Style::default()
         .fg(Theme::FG)
         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
@@ -68,9 +68,16 @@ fn build_keybindings(lines: &mut Vec<Line<'static>>, key: Style, dim: Style) {
     for group in keymap::HELP_GROUPS {
         lines.push(Line::from(Span::styled(group.name, heading)));
         for b in group.bindings {
+            let shown = keymap::effective_key(b.key, group.mode, keys);
             lines.push(Line::from(vec![
-                Span::styled(format!("  {:<14}", b.key), key),
+                Span::styled(format!("  {shown:<14}"), key),
                 Span::styled(b.description, dim),
+            ]));
+        }
+        for (added_key, description) in keymap::added_bindings(group.mode, keys) {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {added_key:<14}"), key),
+                Span::styled(description, dim),
             ]));
         }
         lines.push(Line::from(""));
