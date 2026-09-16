@@ -45,6 +45,7 @@ Your board consists of **columns** (like Backlog, In Progress, Done) that contai
 | **Tags** | Categorize cards with tags like `bug`, `feature`, `urgent` |
 | **Assignees** | Assign cards to team members by name |
 | **Priority** | Set priority level (low, normal, high, urgent). Cards auto-sort by priority |
+| **Manual Order** | Rearrange cards within a priority group with `Shift+Up` / `Shift+Down`; the position is saved in the card file |
 | **Due Dates** | Set a due date on a card. Overdue cards get a visual warning |
 | **Blockers** | Mark a card as blocked with an optional reason explaining what's preventing progress |
 | **Age Tracking** | See how long a card has been sitting around |
@@ -53,9 +54,11 @@ Your board consists of **columns** (like Backlog, In Progress, Done) that contai
 
 You don't need a mouse.
 
-- `h` / `l` - Move between columns
-- `j` / `k` - Move between cards
+- `h` / `l` - Move between columns (arrow keys work too)
+- `j` / `k` - Move between cards (arrow keys work too)
 - `H` / `L` - Move the selected card left or right
+- `Shift+Left` / `Shift+Right` - Move the selected card left or right
+- `Shift+Up` / `Shift+Down` - Move the selected card up or down within its column
 - `Enter` - Open card details
 - `Tab` / `Shift+Tab` - Cycle through cards across all columns
 - `/` - Fuzzy search (supports `!neg` and `@user`)
@@ -130,6 +133,7 @@ Press `.` to repeat the last mutation. The status bar shows what `.` will do (e.
 | Action | Hint | Behavior |
 |--------|------|----------|
 | Move card left/right | `move ->` / `move <-` | Moves selected card one column |
+| Move card up/down | `move ^` / `move v` | Moves selected card one slot within its column |
 | Move to column | `move -> Done` | Moves selected card to the stored column |
 | Set priority | `priority: high` | Applies stored priority to selected card |
 | Set tags | `tags: bug, ui` | Overwrites tags on selected card |

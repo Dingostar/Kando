@@ -19,6 +19,8 @@ pub enum Action {
     // Card movement
     MoveCardPrevColumn,
     MoveCardNextColumn,
+    MoveCardUp,
+    MoveCardDown,
 
     // Card actions
     NewCard,

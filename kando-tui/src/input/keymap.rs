@@ -133,6 +133,18 @@ pub fn map_key(key: KeyEvent, mode: &Mode) -> Action {
 }
 
 fn map_normal(key: KeyEvent) -> Action {
+    // Shifted arrows move the card, plain arrows move the cursor. These arms
+    // must come first: the plain arrow arms below match on code alone, so an
+    // unguarded `KeyCode::Left` would swallow S-Left too.
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        match key.code {
+            KeyCode::Left => return Action::MoveCardPrevColumn,
+            KeyCode::Right => return Action::MoveCardNextColumn,
+            KeyCode::Up => return Action::MoveCardUp,
+            KeyCode::Down => return Action::MoveCardDown,
+            _ => {}
+        }
+    }
     match key.code {
         KeyCode::Char('h') | KeyCode::Left => Action::FocusPrevColumn,
         KeyCode::Char('l') | KeyCode::Right => Action::FocusNextColumn,
@@ -321,6 +333,8 @@ pub struct BindingGroup {
 pub const NORMAL_BINDINGS: &[Binding] = &[
     Binding { key: "h / l", description: "Switch columns" },
     Binding { key: "H / L", description: "Move card left/right" },
+    Binding { key: "S-Left/S-Right", description: "Move card left/right" },
+    Binding { key: "S-Up/S-Down", description: "Move card up/down in column" },
     Binding { key: "j / k", description: "Move between cards" },
     Binding { key: "n / N", description: "Next/prev match" },
     Binding { key: "Enter", description: "Open card detail" },
@@ -585,6 +599,24 @@ mod tests {
     fn normal_shift_h_l_moves_card() {
         assert_eq!(map_key(key(KeyCode::Char('H')), &Mode::Normal), Action::MoveCardPrevColumn);
         assert_eq!(map_key(key(KeyCode::Char('L')), &Mode::Normal), Action::MoveCardNextColumn);
+    }
+
+    #[test]
+    fn normal_shift_arrows_move_the_card() {
+        let shift = |code| KeyEvent::new(code, KeyModifiers::SHIFT);
+        assert_eq!(map_key(shift(KeyCode::Left), &Mode::Normal), Action::MoveCardPrevColumn);
+        assert_eq!(map_key(shift(KeyCode::Right), &Mode::Normal), Action::MoveCardNextColumn);
+        assert_eq!(map_key(shift(KeyCode::Up), &Mode::Normal), Action::MoveCardUp);
+        assert_eq!(map_key(shift(KeyCode::Down), &Mode::Normal), Action::MoveCardDown);
+    }
+
+    #[test]
+    fn normal_plain_arrows_still_move_the_cursor() {
+        // The whole point of the shifted arms is that they don't disturb these.
+        assert_eq!(map_key(key(KeyCode::Left), &Mode::Normal), Action::FocusPrevColumn);
+        assert_eq!(map_key(key(KeyCode::Right), &Mode::Normal), Action::FocusNextColumn);
+        assert_eq!(map_key(key(KeyCode::Up), &Mode::Normal), Action::SelectPrevCard);
+        assert_eq!(map_key(key(KeyCode::Down), &Mode::Normal), Action::SelectNextCard);
     }
 
     #[test]

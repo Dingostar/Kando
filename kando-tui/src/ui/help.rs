@@ -70,13 +70,13 @@ fn build_keybindings(lines: &mut Vec<Line<'static>>, key: Style, dim: Style, key
         for b in group.bindings {
             let shown = keymap::effective_key(b.key, group.mode, keys);
             lines.push(Line::from(vec![
-                Span::styled(format!("  {shown:<14}"), key),
+                Span::styled(format!("  {shown:<16}"), key),
                 Span::styled(b.description, dim),
             ]));
         }
         for (added_key, description) in keymap::added_bindings(group.mode, keys) {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {added_key:<14}"), key),
+                Span::styled(format!("  {added_key:<16}"), key),
                 Span::styled(description, dim),
             ]));
         }

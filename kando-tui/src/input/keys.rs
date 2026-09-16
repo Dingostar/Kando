@@ -178,7 +178,18 @@ impl KeyConfig {
     pub fn lookup(&self, mode: BindMode, key: KeyCode, modifiers: KeyModifiers) -> Option<&Option<Action>> {
         // Ctrl-C and friends keep their built-in meaning: an override on `c`
         // must not swallow the quit binding.
-        if !modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+        //
+        // Shift is the exception, but only for characters, where terminals fold
+        // it into the character itself and `B` arrives as Char('B') + SHIFT. On
+        // a named key it stays a real modifier, so that binding `up` rebinds Up
+        // alone and leaves S-Up to the built-in card-move keys.
+        let shift_is_part_of_the_key = matches!(key, KeyCode::Char(_));
+        let significant = if shift_is_part_of_the_key {
+            modifiers.difference(KeyModifiers::SHIFT)
+        } else {
+            modifiers
+        };
+        if !significant.is_empty() {
             return None;
         }
         self.overrides.get(&(mode, key)).map(|o| &o.action)
@@ -281,6 +292,8 @@ fn parse_action(name: &str) -> Option<Option<Action>> {
         // Cards
         "move_card_prev_column" => Action::MoveCardPrevColumn,
         "move_card_next_column" => Action::MoveCardNextColumn,
+        "move_card_up" => Action::MoveCardUp,
+        "move_card_down" => Action::MoveCardDown,
         "new_card" => Action::NewCard,
         "delete_card" => Action::DeleteCard,
         "edit_card_external" => Action::EditCardExternal,
@@ -403,6 +416,19 @@ mod tests {
         assert!(cfg
             .lookup(BindMode::Normal, KeyCode::Char('B'), KeyModifiers::SHIFT)
             .is_some());
+    }
+
+    #[test]
+    fn shift_stays_a_modifier_on_named_keys() {
+        // Rebinding the plain arrow must not also capture S-Left, which the
+        // built-in keymap uses to move a card.
+        let cfg = KeyConfig::parse("[normal]\nleft = \"find_prev\"").unwrap();
+        assert!(cfg
+            .lookup(BindMode::Normal, KeyCode::Left, KeyModifiers::NONE)
+            .is_some());
+        assert!(cfg
+            .lookup(BindMode::Normal, KeyCode::Left, KeyModifiers::SHIFT)
+            .is_none());
     }
 
     #[test]

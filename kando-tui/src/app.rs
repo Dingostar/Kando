@@ -206,6 +206,7 @@ pub enum PickerTarget {
 pub enum RepeatableAction {
     // Card-level
     MoveCard { forward: bool },
+    ReorderCard { up: bool },
     MoveToColumn { column_slug: String, column_name: String },
     SetPriority(kando_core::board::Priority),
     SetTags(Vec<String>),
@@ -237,6 +238,8 @@ impl RepeatableAction {
         match self {
             Self::MoveCard { forward: true } => "move ->".into(),
             Self::MoveCard { forward: false } => "move <-".into(),
+            Self::ReorderCard { up: true } => "move ^".into(),
+            Self::ReorderCard { up: false } => "move v".into(),
             Self::MoveToColumn { column_name, .. } => format!("move -> {column_name}"),
             Self::SetPriority(p) => format!("priority: {}", p.as_str()),
             Self::SetTags(tags) => format!("tags: {}", tags.join(", ")),
@@ -268,6 +271,8 @@ impl RepeatableAction {
             Self::SetBlocked(_) | Self::SetTags(_) | Self::SetAssignees(_)
             | Self::SetPriority(_) | Self::SetDueDate(_) | Self::SortColumn(_)
             | Self::SetWipLimit(_) | Self::ColSetHidden(_) => RiskLevel::Low,
+
+            Self::ReorderCard { .. } => RiskLevel::Low,
 
             Self::MoveCard { .. } | Self::MoveToColumn { .. } | Self::Archive
             | Self::ColMove { .. } | Self::PipeCommand(_) => RiskLevel::Normal,
@@ -467,6 +472,31 @@ impl AppState {
                     })
                     .expect("visible is non-empty");
             }
+        }
+    }
+
+    /// Put the selection on `card_id` within the focused column.
+    ///
+    /// Called after a card moves to another column. The card lands wherever
+    /// `sort_cards` puts it, which is almost never the index it left behind, so
+    /// clamping the old index would strand the cursor on an unrelated card.
+    /// Falls back to clamping when the card can't be selected: a stale id, or a
+    /// card the active filter hides — a staleness filter reads `updated`, which
+    /// the move just touched, so a moved card really can vanish from view.
+    pub fn select_moved_card(&mut self, board: &Board, card_id: &str) {
+        let landed = board
+            .columns
+            .get(self.focused_column)
+            .and_then(|col| col.cards.iter().position(|c| c.id == card_id));
+        match landed {
+            Some(idx)
+                if !self.has_active_filter()
+                    || visible_card_indices(&board.columns[self.focused_column], self, board)
+                        .contains(&idx) =>
+            {
+                self.selected_card = idx;
+            }
+            _ => self.clamp_selection_filtered(board),
         }
     }
 }
@@ -731,6 +761,61 @@ fn handle_auto_close(
     Ok(())
 }
 
+/// Try to move the selected card one slot up or down inside its column.
+///
+/// Movement is confined to the card's priority group, because priority is the
+/// primary sort key: a card nudged past that boundary would just spring back on
+/// the next sort. Hitting the boundary says so rather than silently doing
+/// nothing. Returns `Ok(Some(sync_msg))` if the card actually moved.
+fn try_reorder_card(
+    board: &mut Board,
+    state: &mut AppState,
+    up: bool,
+    kando_dir: &std::path::Path,
+) -> color_eyre::Result<Option<String>> {
+    let col = match board.columns.get(state.focused_column) {
+        Some(col) if !col.cards.is_empty() => col,
+        Some(_) => {
+            state.notify("No cards to move");
+            return Ok(None);
+        }
+        None => unreachable!("focused_column always refers to a valid column index"),
+    };
+    let from = state.selected_card.min(col.cards.len() - 1);
+
+    // Step over cards the active filter hides, so a move always changes what
+    // the user can see rather than shuffling rows behind the filter.
+    let visible = state
+        .has_active_filter()
+        .then(|| visible_card_indices(col, state, board));
+    let is_visible = |i: usize| visible.as_ref().is_none_or(|v| v.contains(&i));
+
+    let Some(to) = col.reorder_target(from, up, is_visible) else {
+        state.notify(if up {
+            "Top of priority group"
+        } else {
+            "Bottom of priority group"
+        });
+        return Ok(None);
+    };
+
+    let card_id = col.cards[from].id.clone();
+    let card_title = col.cards[from].title.clone();
+    let col_name = col.name.clone();
+    let col_idx = state.focused_column;
+    if !board.columns[col_idx].reorder_card(from, to) {
+        return Ok(None);
+    }
+    state.selected_card = to;
+    save_board(kando_dir, board)?;
+    append_activity(kando_dir, "reorder", &card_id, &card_title,
+        &[("column", &col_name), ("to", &to.to_string())]);
+    state.notify(if up { "Card moved up" } else { "Card moved down" });
+    Ok(Some(format!(
+        "Reorder card #{card_id} \"{card_title}\" in {col_name}"
+    )))
+}
+
 /// Try to move the selected card to an adjacent visible column.
 /// Returns `Ok(Some(sync_msg))` if the card was moved, `Ok(None)` if WIP confirmation
 /// was triggered or no move was possible.
@@ -776,7 +861,7 @@ fn try_move_card(
     board.move_card(from, card_idx, to);
     board.columns[to].sort_cards();
     state.focused_column = to;
-    state.clamp_selection_filtered(board);
+    state.select_moved_card(board, &card_id);
     save_board(kando_dir, board)?;
     append_activity(kando_dir, "move", &card_id, &card_title,
         &[("from", &from_name), ("to", &to_name)]);
@@ -1018,6 +1103,8 @@ fn process_action(
         // Card movement & actions
         Action::MoveCardPrevColumn
         | Action::MoveCardNextColumn
+        | Action::MoveCardUp
+        | Action::MoveCardDown
         | Action::NewCard
         | Action::DeleteCard
         | Action::ArchiveCard
@@ -1338,6 +1425,9 @@ fn handle_repeat_last(
             // Delegate to existing try_move_card (handles WIP limits)
             return try_move_card(board, state, forward, kando_dir);
         }
+        RepeatableAction::ReorderCard { up } => {
+            return try_reorder_card(board, state, up, kando_dir);
+        }
         RepeatableAction::MoveToColumn { column_slug, column_name } => {
             let target_col = board.columns.iter().enumerate()
                 .find(|(i, c)| c.slug == column_slug && *i != state.focused_column)
@@ -1357,7 +1447,7 @@ fn handle_repeat_last(
             board.move_card(from, card_idx, to);
             board.columns[to].sort_cards();
             state.focused_column = to;
-            state.clamp_selection_filtered(board);
+            state.select_moved_card(board, &card_id);
             save_board(kando_dir, board)?;
             append_activity(kando_dir, "move", &card_id, &card_title,
                 &[("from", &from_name), ("to", &to_name)]);
@@ -1955,6 +2045,18 @@ where
             sync_message = try_move_card(board, state, true, kando_dir)?;
             if sync_message.is_some() {
                 state.last_repeatable = Some(RepeatableAction::MoveCard { forward: true });
+            }
+        }
+        Action::MoveCardUp => {
+            sync_message = try_reorder_card(board, state, true, kando_dir)?;
+            if sync_message.is_some() {
+                state.last_repeatable = Some(RepeatableAction::ReorderCard { up: true });
+            }
+        }
+        Action::MoveCardDown => {
+            sync_message = try_reorder_card(board, state, false, kando_dir)?;
+            if sync_message.is_some() {
+                state.last_repeatable = Some(RepeatableAction::ReorderCard { up: false });
             }
         }
         Action::NewCard => {
@@ -3438,7 +3540,7 @@ fn handle_input_confirm(
                             board.move_card(from, card_idx, to);
                             board.columns[to].sort_cards();
                             state.focused_column = to;
-                            state.clamp_selection_filtered(board);
+                            state.select_moved_card(board, &card_id);
                             save_board(kando_dir, board)?;
                             append_activity(kando_dir, "move", &card_id, &card_title,
                                 &[("from", &from_name), ("to", &to_name)]);
@@ -3716,7 +3818,7 @@ fn handle_confirm(
                     board.move_card(from, ci, to);
                     board.columns[to].sort_cards();
                     state.focused_column = to;
-                    state.clamp_selection_filtered(board);
+                    state.select_moved_card(board, &card_id);
                     save_board(kando_dir, board)?;
                     append_activity(kando_dir, "move", &card_id, &card_title,
                         &[("from", &from_name), ("to", &to_name)]);
@@ -5419,6 +5521,112 @@ mod tests {
         std::path::Path::new("/tmp/fake")
     }
 
+    // ── Reordering a card inside its column ──
+
+    /// A board whose only column holds `n` Normal-priority cards in a known
+    /// order, backed by a real .kando dir so saving works.
+    fn reorder_fixture(n: usize) -> (tempfile::TempDir, std::path::PathBuf, Board, AppState) {
+        let (dir, kando_dir) = setup_kando_dir();
+        let mut board = kando_core::board::storage::load_board(&kando_dir).unwrap();
+        board.columns.truncate(1);
+        board.columns[0].cards = (0..n)
+            .map(|i| {
+                let mut card = Card::new(i.to_string(), format!("Card {i}"));
+                card.order = Some(i as u32);
+                card
+            })
+            .collect();
+        let mut state = AppState::new();
+        state.focused_column = 0;
+        (dir, kando_dir, board, state)
+    }
+
+    fn card_ids(board: &Board) -> Vec<String> {
+        board.columns[0].cards.iter().map(|c| c.id.clone()).collect()
+    }
+
+    #[test]
+    fn move_card_up_swaps_with_the_card_above_and_follows_the_selection() {
+        let (_dir, kando_dir, mut board, mut state) = reorder_fixture(3);
+        state.selected_card = 2;
+        let mut terminal = test_terminal();
+        handle_card_action(&mut board, &mut state, Action::MoveCardUp, &mut terminal, &kando_dir, false).unwrap();
+        assert_eq!(card_ids(&board), ["0", "2", "1"]);
+        assert_eq!(state.selected_card, 1, "selection should follow the card");
+        assert_eq!(state.notification.as_deref(), Some("Card moved up"));
+    }
+
+    #[test]
+    fn move_card_down_swaps_with_the_card_below() {
+        let (_dir, kando_dir, mut board, mut state) = reorder_fixture(3);
+        state.selected_card = 0;
+        let mut terminal = test_terminal();
+        handle_card_action(&mut board, &mut state, Action::MoveCardDown, &mut terminal, &kando_dir, false).unwrap();
+        assert_eq!(card_ids(&board), ["1", "0", "2"]);
+        assert_eq!(state.selected_card, 1);
+    }
+
+    #[test]
+    fn move_card_up_at_the_top_notifies_instead_of_wrapping() {
+        let (_dir, kando_dir, mut board, mut state) = reorder_fixture(3);
+        state.selected_card = 0;
+        let mut terminal = test_terminal();
+        handle_card_action(&mut board, &mut state, Action::MoveCardUp, &mut terminal, &kando_dir, false).unwrap();
+        assert_eq!(card_ids(&board), ["0", "1", "2"]);
+        assert_eq!(state.notification.as_deref(), Some("Top of priority group"));
+    }
+
+    #[test]
+    fn move_card_down_at_the_bottom_notifies_instead_of_wrapping() {
+        let (_dir, kando_dir, mut board, mut state) = reorder_fixture(3);
+        state.selected_card = 2;
+        let mut terminal = test_terminal();
+        handle_card_action(&mut board, &mut state, Action::MoveCardDown, &mut terminal, &kando_dir, false).unwrap();
+        assert_eq!(card_ids(&board), ["0", "1", "2"]);
+        assert_eq!(state.notification.as_deref(), Some("Bottom of priority group"));
+    }
+
+    #[test]
+    fn move_card_up_stops_at_a_higher_priority_card() {
+        let (_dir, kando_dir, mut board, mut state) = reorder_fixture(2);
+        board.columns[0].cards[0].priority = kando_core::board::Priority::Urgent;
+        state.selected_card = 1;
+        let mut terminal = test_terminal();
+        handle_card_action(&mut board, &mut state, Action::MoveCardUp, &mut terminal, &kando_dir, false).unwrap();
+        assert_eq!(card_ids(&board), ["0", "1"]);
+        assert_eq!(state.notification.as_deref(), Some("Top of priority group"));
+    }
+
+    #[test]
+    fn move_card_in_an_empty_column_notifies_no_cards_to_move() {
+        let (_dir, kando_dir, mut board, mut state) = reorder_fixture(0);
+        let mut terminal = test_terminal();
+        handle_card_action(&mut board, &mut state, Action::MoveCardUp, &mut terminal, &kando_dir, false).unwrap();
+        assert_eq!(state.notification.as_deref(), Some("No cards to move"));
+    }
+
+    #[test]
+    fn a_reorder_is_written_to_disk() {
+        let (_dir, kando_dir, mut board, mut state) = reorder_fixture(3);
+        state.selected_card = 2;
+        let mut terminal = test_terminal();
+        handle_card_action(&mut board, &mut state, Action::MoveCardUp, &mut terminal, &kando_dir, false).unwrap();
+        let reloaded = kando_core::board::storage::load_board(&kando_dir).unwrap();
+        let ids: Vec<String> = reloaded.columns[0].cards.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(ids, ["0", "2", "1"]);
+    }
+
+    #[test]
+    fn a_reorder_is_repeatable_with_dot() {
+        let (_dir, kando_dir, mut board, mut state) = reorder_fixture(3);
+        state.selected_card = 2;
+        let mut terminal = test_terminal();
+        handle_card_action(&mut board, &mut state, Action::MoveCardUp, &mut terminal, &kando_dir, false).unwrap();
+        assert_eq!(state.last_repeatable, Some(RepeatableAction::ReorderCard { up: true }));
+        handle_repeat_last(&mut board, &mut state, &kando_dir).unwrap();
+        assert_eq!(card_ids(&board), ["2", "0", "1"]);
+    }
+
     // ── Filter guard ──
 
     #[test]
@@ -5476,6 +5684,57 @@ mod tests {
         assert!(state.notification.is_none());
     }
 
+    // ── the selection follows a card across columns ──
+
+    /// Two populated columns, so the moved card's old index is a real card in
+    /// the destination. Clamping that index instead of following the card would
+    /// quietly select the wrong one, which is the bug these cover.
+    fn cross_column_fixture() -> (tempfile::TempDir, std::path::PathBuf, Board, AppState) {
+        let (dir, kando_dir) = setup_kando_dir();
+        let mut board = kando_core::board::storage::load_board(&kando_dir).unwrap();
+        board.columns[0].cards = (0..3)
+            .map(|i| Card::new(format!("a{i}"), format!("A {i}")))
+            .collect();
+        board.columns[1].cards = (0..3)
+            .map(|i| Card::new(format!("b{i}"), format!("B {i}")))
+            .collect();
+        // The default "In Progress" column carries wip_limit = 3, which these
+        // three cards would already breach, diverting the move into the confirm
+        // prompt. Each test opts into the limit it wants instead.
+        board.columns[1].wip_limit = None;
+        let mut state = AppState::new();
+        state.focused_column = 0;
+        state.selected_card = 2;
+        (dir, kando_dir, board, state)
+    }
+
+    #[test]
+    fn moving_a_card_to_the_next_column_keeps_the_selection_on_it() {
+        let (_dir, kando_dir, mut board, mut state) = cross_column_fixture();
+
+        try_move_card(&mut board, &mut state, true, &kando_dir).unwrap();
+
+        assert_eq!(state.focused_column, 1);
+        let landed = board.columns[1].cards.iter().position(|c| c.id == "a2").unwrap();
+        assert_ne!(landed, 2, "fixture must land the card at a new index or this proves nothing");
+        assert_eq!(state.selected_card, landed, "selection should follow the moved card");
+    }
+
+    #[test]
+    fn confirming_a_wip_limit_move_keeps_the_selection_on_the_card() {
+        let (_dir, kando_dir, mut board, mut state) = cross_column_fixture();
+        board.columns[1].wip_limit = Some(1);
+        state.mode = Mode::Confirm {
+            prompt: "Column over WIP limit, move anyway?",
+            on_confirm: ConfirmTarget::WipLimitMove { from_col: 0, card_idx: 2, to_col: 1 },
+        };
+
+        handle_confirm(&mut board, &mut state, Action::Confirm, &kando_dir).unwrap();
+
+        assert_eq!(state.focused_column, 1);
+        let landed = board.columns[1].cards.iter().position(|c| c.id == "a2").unwrap();
+        assert_eq!(state.selected_card, landed);
+    }
     // ── try_move_card boundary and empty-column ──
 
     #[test]

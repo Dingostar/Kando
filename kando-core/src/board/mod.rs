@@ -160,6 +160,12 @@ pub struct Card {
     pub updated: DateTime<Utc>,
     #[serde(default)]
     pub priority: Priority,
+    /// Manual position within the card's priority group, set by reordering a
+    /// column. `None` means the card has never been placed by hand, and falls
+    /// back to `updated` for its position — which is how a column nobody has
+    /// reordered keeps sorting newest-first. See [`Column::sort_cards`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<u32>,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
@@ -226,6 +232,7 @@ impl Card {
             created: now,
             updated: now,
             priority: Priority::default(),
+            order: None,
             tags: Vec::new(),
             assignees: Vec::new(),
             blocked: None,
@@ -250,6 +257,16 @@ impl Card {
     /// Touch the card, updating its `updated` timestamp.
     pub fn touch(&mut self) {
         self.updated = Utc::now();
+    }
+
+    /// Forget the card's hand-placed position, so it sorts by recency again.
+    ///
+    /// Call this whenever a card changes column: `order` is an index into the
+    /// column it was placed in, and carrying it across would drop the card at
+    /// an arbitrary depth of its new one instead of at the top where a
+    /// just-moved card belongs.
+    pub fn unplace(&mut self) {
+        self.order = None;
     }
 }
 
@@ -283,6 +300,7 @@ impl Board {
         }
         let mut card = self.columns[from_col].cards.remove(card_idx);
         card.touch();
+        card.unplace();
         // Set started when card first moves past backlog (column 0).
         // Commitment is a one-time event: never cleared once set.
         if card.started.is_none() && to_col > 0 {
@@ -524,15 +542,74 @@ pub fn normalize_column_orders(columns: &mut [Column]) {
 }
 
 impl Column {
-    /// Sort cards by priority (urgent first) then by updated timestamp (most recent first).
+    /// Sort cards by priority (urgent first), then by any manual position the
+    /// user has given them, then by updated timestamp (most recent first).
+    ///
+    /// Priority stays the primary key, so reordering can only ever rearrange
+    /// cards *within* a priority group — a Low card can't be pushed above an
+    /// Urgent one. A card with no manual position sorts as if it were at 0,
+    /// which keeps a freshly added card at the top of its group the way it
+    /// always has, ahead of cards placed by hand below it.
     pub fn sort_cards(&mut self) {
         self.cards
             .sort_by(|a, b| {
                 a.priority
                     .sort_key()
                     .cmp(&b.priority.sort_key())
+                    .then(a.order.unwrap_or(0).cmp(&b.order.unwrap_or(0)))
                     .then(b.updated.cmp(&a.updated))
             });
+    }
+
+    /// Move the card at `from` to index `to`, shifting the cards in between.
+    ///
+    /// Returns false, changing nothing, if either index is out of range or the
+    /// two are the same. The caller keeps the move inside one priority group;
+    /// a move across groups would just be undone by the next
+    /// [`sort_cards`](Self::sort_cards).
+    pub fn reorder_card(&mut self, from: usize, to: usize) -> bool {
+        if from >= self.cards.len() || to >= self.cards.len() || from == to {
+            return false;
+        }
+        let card = self.cards.remove(from);
+        self.cards.insert(to, card);
+        self.renumber();
+        true
+    }
+
+    /// Stamp every card with its current index, so the arrangement survives the
+    /// next sort and the trip through disk. Placing one card by hand means
+    /// pinning all of them: leaving the rest on `None` would let `updated` keep
+    /// voting on where they go.
+    fn renumber(&mut self) {
+        for (i, card) in self.cards.iter_mut().enumerate() {
+            card.order = Some(i as u32);
+        }
+    }
+
+    /// The index the card at `idx` moves to when nudged one slot `up` (or down),
+    /// stepping over cards that `is_visible` rejects.
+    ///
+    /// `None` means the card is already at the edge of its priority group, or
+    /// the last visible one in it. Filtered-out cards are stepped over rather
+    /// than swapped with, so a move always changes what you can see.
+    pub fn reorder_target(
+        &self,
+        idx: usize,
+        up: bool,
+        is_visible: impl Fn(usize) -> bool,
+    ) -> Option<usize> {
+        let priority = self.cards.get(idx)?.priority;
+        let mut i = idx;
+        loop {
+            i = if up { i.checked_sub(1)? } else { i + 1 };
+            if self.cards.get(i)?.priority != priority {
+                return None;
+            }
+            if is_visible(i) {
+                return Some(i);
+            }
+        }
     }
 
     /// Whether this column is at or over its WIP limit.
@@ -1179,6 +1256,120 @@ mod tests {
         // Out-of-bounds column index
         board.move_card(999, 0, 0);
         board.move_card(0, 0, 999);
+    }
+
+    // ── reordering within a column ──
+
+    fn col_with(cards: Vec<Card>) -> Column {
+        Column {
+            slug: "test".into(),
+            name: "Test".into(),
+            order: 0,
+            wip_limit: None,
+            hidden: false,
+            cards,
+        }
+    }
+
+    /// Four Normal-priority cards, newest first, as `sort_cards` would leave them.
+    fn four_normal_cards() -> Column {
+        use chrono::TimeZone;
+        let cards = (0..4)
+            .map(|i| {
+                let mut card = Card::new(i.to_string(), format!("Card {i}"));
+                // Descending updated, so the untouched order is 0, 1, 2, 3.
+                card.updated = Utc.with_ymd_and_hms(2025, 6, 4 - i as u32, 0, 0, 0).unwrap();
+                card
+            })
+            .collect();
+        let mut col = col_with(cards);
+        col.sort_cards();
+        assert_eq!(ids(&col), ["0", "1", "2", "3"]);
+        col
+    }
+
+    fn ids(col: &Column) -> Vec<String> {
+        col.cards.iter().map(|c| c.id.clone()).collect()
+    }
+
+    #[test]
+    fn reorder_survives_a_resort() {
+        // The whole point: without renumbering, `updated` would pull the card back.
+        let mut col = four_normal_cards();
+        assert!(col.reorder_card(3, 1));
+        assert_eq!(ids(&col), ["0", "3", "1", "2"]);
+        col.sort_cards();
+        assert_eq!(ids(&col), ["0", "3", "1", "2"], "sort undid the reorder");
+    }
+
+    #[test]
+    fn reorder_rejects_out_of_range_and_no_op_moves() {
+        let mut col = four_normal_cards();
+        assert!(!col.reorder_card(0, 0));
+        assert!(!col.reorder_card(0, 4));
+        assert!(!col.reorder_card(9, 0));
+        assert_eq!(ids(&col), ["0", "1", "2", "3"]);
+        assert!(col.cards.iter().all(|c| c.order.is_none()), "no-op still renumbered");
+    }
+
+    #[test]
+    fn reorder_target_walks_one_slot_at_a_time() {
+        let col = four_normal_cards();
+        assert_eq!(col.reorder_target(2, true, |_| true), Some(1));
+        assert_eq!(col.reorder_target(2, false, |_| true), Some(3));
+    }
+
+    #[test]
+    fn reorder_target_stops_at_the_priority_boundary() {
+        let mut urgent = Card::new("u".into(), "Urgent".into());
+        urgent.priority = Priority::Urgent;
+        let low = Card::new("n".into(), "Normal".into());
+        let col = col_with(vec![urgent, low]);
+
+        // The Normal card can't climb above the Urgent one, and vice versa.
+        assert_eq!(col.reorder_target(1, true, |_| true), None);
+        assert_eq!(col.reorder_target(0, false, |_| true), None);
+    }
+
+    #[test]
+    fn reorder_target_steps_over_filtered_out_cards() {
+        let col = four_normal_cards();
+        // Only 0 and 3 are visible: 3 moving up lands where 0 is, not where 2 is.
+        let visible = |i: usize| i == 0 || i == 3;
+        assert_eq!(col.reorder_target(3, true, visible), Some(0));
+        // Nothing visible below 3, so there is nowhere to go.
+        assert_eq!(col.reorder_target(3, false, visible), None);
+    }
+
+    #[test]
+    fn reorder_target_at_the_ends_of_the_column() {
+        let col = four_normal_cards();
+        assert_eq!(col.reorder_target(0, true, |_| true), None);
+        assert_eq!(col.reorder_target(3, false, |_| true), None);
+        assert_eq!(col.reorder_target(9, true, |_| true), None, "out of range");
+    }
+
+    #[test]
+    fn a_card_changing_column_forgets_its_hand_placed_position() {
+        // order is an index into the old column; carried over, it would drop
+        // the card partway down the new one instead of at the top.
+        let mut board = test_board_with_done();
+        board.columns[0].cards.push(Card::new("x".into(), "Moved".into()));
+        let idx = board.columns[0].cards.len() - 1;
+        board.columns[0].cards[idx].order = Some(7);
+        board.move_card(0, idx, 1);
+        let moved = board.columns[1].cards.iter().find(|c| c.id == "x").unwrap();
+        assert_eq!(moved.order, None);
+    }
+
+    #[test]
+    fn a_new_card_still_lands_at_the_top_of_its_priority_group() {
+        // Adding to a hand-ordered column must not send the new card to the bottom.
+        let mut col = four_normal_cards();
+        col.reorder_card(3, 0);
+        col.cards.push(Card::new("new".into(), "New".into()));
+        col.sort_cards();
+        assert_eq!(col.cards[0].id, "new");
     }
 
     // ── sort_cards specifics ──

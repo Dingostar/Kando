@@ -519,6 +519,9 @@ fn serialize_card(card: &Card) -> String {
         card.updated.format("%Y-%m-%dT%H:%M:%SZ")
     ));
     fm.push_str(&format!("priority = {:?}\n", card.priority.as_str()));
+    if let Some(order) = card.order {
+        fm.push_str(&format!("order = {order}\n"));
+    }
     if !card.tags.is_empty() {
         let tags: Vec<String> = card.tags.iter().map(|t| format!("{t:?}")).collect();
         fm.push_str(&format!("tags = [{}]\n", tags.join(", ")));
@@ -1101,6 +1104,49 @@ mod tests {
         assert_eq!(deserialized.priority, Priority::High);
         assert_eq!(deserialized.tags, vec!["bug", "ui"]);
         assert_eq!(body, "Some description here.");
+    }
+
+    #[test]
+    fn card_order_roundtrips_and_stays_absent_when_unset() {
+        let mut card = Card::new("042".into(), "Placed by hand".into());
+        card.order = Some(3);
+        let serialized = serialize_card(&card);
+        assert!(serialized.contains("order = 3"), "{serialized}");
+        let (fm, _) = parse_frontmatter(&serialized).unwrap();
+        assert_eq!(toml::from_str::<Card>(&fm).unwrap().order, Some(3));
+
+        // An unplaced card writes no `order` key at all, so existing boards
+        // keep their current diffs.
+        let plain = serialize_card(&Card::new("043".into(), "Untouched".into()));
+        assert!(!plain.contains("order"), "{plain}");
+        let (fm, _) = parse_frontmatter(&plain).unwrap();
+        assert_eq!(toml::from_str::<Card>(&fm).unwrap().order, None);
+    }
+
+    #[test]
+    fn a_hand_ordered_column_keeps_its_arrangement_across_a_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let kando_dir = init_board_at(&dir.path().join(".kando"), "Test", None).unwrap();
+
+        let mut board = load_board(&kando_dir).unwrap();
+        for i in 0..3 {
+            let card = Card::new(board.next_card_id(), format!("Card {i}"));
+            board.columns[0].cards.push(card);
+        }
+        board.columns[0].sort_cards();
+        let reversed: Vec<String> = board.columns[0]
+            .cards
+            .iter()
+            .rev()
+            .map(|c| c.id.clone())
+            .collect();
+        assert!(board.columns[0].reorder_card(0, 2));
+        assert!(board.columns[0].reorder_card(0, 1));
+        save_board(&kando_dir, &board).unwrap();
+
+        let reloaded = load_board(&kando_dir).unwrap();
+        let got: Vec<String> = reloaded.columns[0].cards.iter().map(|c| c.id.clone()).collect();
+        assert_eq!(got, reversed);
     }
 
     #[test]

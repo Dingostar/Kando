@@ -115,8 +115,9 @@ pub fn run_auto_close(board: &mut Board, now: DateTime<Utc>) -> Vec<ClosedCard> 
     let mut closed_ids = Vec::new();
     for &(col_idx, card_idx) in to_move.iter().rev() {
         let from_col_slug = board.columns[col_idx].slug.clone();
-        let card = board.columns[col_idx].cards.remove(card_idx);
+        let mut card = board.columns[col_idx].cards.remove(card_idx);
         closed_ids.push(ClosedCard { id: card.id.clone(), title: card.title.clone(), from_col_slug });
+        card.unplace();
         board.columns[target_col].cards.push(card);
     }
 
@@ -175,13 +176,14 @@ pub fn run_auto_archive(board: &mut Board, now: DateTime<Utc>) -> Vec<ArchivedCa
     let done_slug = board.columns[done_idx].slug.clone();
     let mut archived = Vec::new();
     for idx in to_archive {
-        let card = board.columns[done_idx].cards.remove(idx);
+        let mut card = board.columns[done_idx].cards.remove(idx);
         archived.push(ArchivedCard {
             id: card.id.clone(),
             title: card.title.clone(),
             from_col_slug: done_slug.clone(),
         });
         // Direct push bypasses move_card() to preserve the completed timestamp.
+        card.unplace();
         board.columns[archive_idx].cards.push(card);
     }
 
