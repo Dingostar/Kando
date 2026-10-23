@@ -189,6 +189,11 @@ enum Command {
         #[command(subcommand)]
         action: Option<HooksAction>,
     },
+    /// Give cards a jj change when they enter In Progress (per board)
+    Jj {
+        #[command(subcommand)]
+        action: Option<JjAction>,
+    },
     /// Migrate a local git-synced board to shadow-primary storage
     ///
     /// Moves .kando/ data to the shadow clone and replaces it with a .kando.toml marker.
@@ -327,6 +332,21 @@ enum HooksAction {
         /// Hook name (e.g. post-create, post-move)
         name: String,
     },
+}
+
+#[derive(Subcommand)]
+enum JjAction {
+    /// Turn the jj integration on for this board
+    On {
+        /// Revset a card's change starts from when none of its blockers has one
+        /// [default: main]
+        #[arg(long)]
+        base: Option<String>,
+    },
+    /// Turn the jj integration off for this board
+    Off,
+    /// Show whether the jj integration is on for this board
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -648,6 +668,7 @@ fn main() {
         Some(Command::Col { action }) => cmd_col_cli(&cwd, action, json),
         Some(Command::Template { action }) => cmd_template_cli(&cwd, action, json),
         Some(Command::Hooks { action }) => cmd_hooks_cli(&cwd, action, json),
+        Some(Command::Jj { action }) => cmd_jj(&cwd, action, json),
         Some(Command::Migrate) => cmd_migrate(&cwd),
         None => cmd_tui(&cwd, cli.nerd_font),
     };
@@ -1096,7 +1117,13 @@ fn cmd_move(cwd: &Path, card_id: &str, target: &str, json: bool) -> color_eyre::
         ctx.sync_push(ss, &format!("Move card #{card_id} to {to_name}"));
     }
 
+    // The move has happened either way; a jj failure is only reported.
+    let jj = run_jj_for_move(&ctx, &board, card_id);
+
     if json {
+        if let Some(Ok(msg) | Err(msg)) = jj {
+            eprintln!("{msg}");
+        }
         return print_json(&MutationResult {
             id: card_id.to_string(), title: String::new(),
             column: None, from: Some(from_name), to: Some(to_name),
@@ -1104,6 +1131,74 @@ fn cmd_move(cwd: &Path, card_id: &str, target: &str, json: bool) -> color_eyre::
     }
 
     println!("Moved {} to {}", card_id, to_name);
+    match jj {
+        Some(Ok(msg)) => println!("{msg}"),
+        Some(Err(msg)) => eprintln!("{msg}"),
+        None => {}
+    }
+    Ok(())
+}
+
+/// Give a card moved from the CLI its jj change, if the integration is on and
+/// the card landed in In Progress. Runs inline: the CLI exits right after.
+fn run_jj_for_move(ctx: &BoardContext, board: &Board, card_id: &str) -> Option<Result<String, String>> {
+    use kando_core::board::jj::JjSettings;
+    let cfg = kando_core::board::storage::load_local_config(&ctx.kando_dir).ok()?;
+    let job = JjSettings::from_config(&cfg, &ctx.project_root)?.job_for_move(board, card_id)?;
+    Some(job.run())
+}
+
+fn cmd_jj(cwd: &Path, action: Option<JjAction>, json: bool) -> color_eyre::Result<()> {
+    use kando_core::board::jj::{check_base, check_repo, DEFAULT_BASE};
+    use kando_core::board::storage::{load_local_config, save_local_config};
+
+    #[derive(Serialize)]
+    struct JjStatus {
+        enabled: bool,
+        repo: String,
+        base: String,
+    }
+
+    let ctx = resolve_board(cwd)?;
+    let repo = &ctx.project_root;
+    let mut cfg = load_local_config(&ctx.kando_dir)?;
+
+    match action {
+        Some(JjAction::On { base }) => {
+            check_repo(repo).map_err(|e| {
+                color_eyre::eyre::eyre!("{} is not a jj repo ({e})", repo.display())
+            })?;
+            let base = base.or_else(|| cfg.jj_base.clone());
+            let effective = base.clone().unwrap_or_else(|| DEFAULT_BASE.into());
+            check_base(repo, &effective).map_err(|e| {
+                color_eyre::eyre::eyre!("base '{effective}' does not resolve ({e}); pick one with --base")
+            })?;
+            cfg.jj = true;
+            cfg.jj_base = base;
+            save_local_config(&ctx.kando_dir, &cfg)?;
+        }
+        Some(JjAction::Off) => {
+            cfg.jj = false;
+            save_local_config(&ctx.kando_dir, &cfg)?;
+        }
+        None | Some(JjAction::Status) => {}
+    }
+
+    let status = JjStatus {
+        enabled: cfg.jj,
+        repo: repo.display().to_string(),
+        base: cfg.jj_base.clone().unwrap_or_else(|| DEFAULT_BASE.into()),
+    };
+    if json {
+        return print_json(&status);
+    }
+    if status.enabled {
+        println!("jj integration is on for {}", status.repo);
+        println!("Cards moved to In Progress get a change based on their blockers' changes, or on '{}'.", status.base);
+    } else {
+        println!("jj integration is off for {}", status.repo);
+        println!("Turn it on with: kando jj on");
+    }
     Ok(())
 }
 
@@ -4366,6 +4461,65 @@ mod tests {
         setup_board_with_card(dir.path());
         let result = cmd_delete(dir.path(), "nonexistent", false);
         assert!(result.is_err(), "deleting a non-existent card should return Err");
+    }
+
+    // ── cmd_jj tests ──
+
+    fn jj_available() -> bool {
+        std::process::Command::new("jj").arg("--version").output().is_ok_and(|o| o.status.success())
+    }
+
+    fn jj_in(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("jj").current_dir(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "jj {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn cmd_jj_on_refuses_a_non_jj_project() {
+        if !jj_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (kando_dir, _) = setup_board_with_card(dir.path());
+        let err = cmd_jj(dir.path(), Some(JjAction::On { base: None }), false).unwrap_err();
+        assert!(err.to_string().contains("is not a jj repo"), "{err}");
+        assert!(!kando_core::board::storage::load_local_config(&kando_dir).unwrap().jj);
+    }
+
+    #[test]
+    fn cmd_jj_on_then_move_creates_change_and_off_stops_it() {
+        if !jj_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (kando_dir, id) = setup_board_with_card(dir.path());
+        jj_in(dir.path(), &["git", "init", "--quiet"]);
+        jj_in(dir.path(), &["bookmark", "create", "--quiet", "main", "-r", "@"]);
+
+        // A base that doesn't resolve is refused up front.
+        let err = cmd_jj(dir.path(), Some(JjAction::On { base: Some("nope".into()) }), false).unwrap_err();
+        assert!(err.to_string().contains("does not resolve"), "{err}");
+
+        cmd_jj(dir.path(), Some(JjAction::On { base: None }), false).unwrap();
+        assert!(kando_core::board::storage::load_local_config(&kando_dir).unwrap().jj);
+
+        cmd_move(dir.path(), &id, "in-progress", false).unwrap();
+        let tagged = format!(r#"description(regex:"(?m)^Kando-Card: {id}$")"#);
+        let title = jj_in(dir.path(), &["log", "--no-graph", "-r", &tagged, "-T", "description.first_line()"]);
+        assert_eq!(title, "Test card");
+
+        cmd_jj(dir.path(), Some(JjAction::Off), false).unwrap();
+        let (_, second) = {
+            let mut board = load_board(&kando_dir).unwrap();
+            let id = board.next_card_id();
+            board.columns[0].cards.push(Card::new(id.clone(), "Second".into()));
+            kando_core::board::storage::save_board(&kando_dir, &board).unwrap();
+            ((), id)
+        };
+        cmd_move(dir.path(), &second, "in-progress", false).unwrap();
+        let none = format!(r#"description(regex:"(?m)^Kando-Card: {second}$")"#);
+        assert!(jj_in(dir.path(), &["log", "--no-graph", "-r", &none, "-T", "change_id"]).is_empty());
     }
 
     // ── cmd_edit tests ──

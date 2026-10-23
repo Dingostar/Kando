@@ -396,6 +396,24 @@ Now every time a card is created (TUI or CLI), your Mac reads the title aloud.
 
 Hooks run in background threads so they never block the TUI. The first line of stdout (or stderr) is shown as a notification in the status bar. Results are logged to `.kando/hooks.log`.
 
+### jj integration
+
+If your project is a [jj](https://jj-vcs.github.io/jj/) repo, kando can give each card its own change when it moves to In Progress:
+
+```bash
+kando jj on                  # this board only; checks the repo and base first
+kando jj on --base 'trunk()' # start cards from somewhere other than main
+kando jj off
+kando jj                     # show whether it's on
+```
+
+- The change is created with `jj new --no-edit`, so your working copy stays where it is. `jj edit` it when you start the work.
+- Its description is the card title followed by a `Kando-Card: <id>` trailer, which is how kando finds a card's change again. Nothing is written to the card itself.
+- Its parents are the changes of the card's blockers (see `blocked_by`), done or not. If one blocker's change already builds on another's, only the newer one is used. Blockers without a change are skipped and named in the message. With no parents left, the change starts from the base (`main` unless set with `--base`).
+- A card that already has a change keeps it, so moving it out of In Progress and back creates nothing new.
+
+It works for moves in the TUI (reported in the status bar) and with `kando move`. The setting lives in the board's `.kando/local.toml`, so it is per user and never synced.
+
 ### JSON Output
 
 All commands produce human-readable output by default. For scripting and automation, pass the global `--json` flag to get structured JSON instead:

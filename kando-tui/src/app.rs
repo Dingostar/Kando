@@ -348,6 +348,8 @@ pub struct AppState {
     pub detail_image: usize,
     /// Detail pane is showing text full height, image hidden (`i`).
     pub detail_image_collapsed: bool,
+    /// The jj integration's settings while it is switched on (`kando jj on`).
+    pub jj: Option<kando_core::board::jj::JjSettings>,
     /// Keybinding overrides from ~/.config/kando/keys.toml.
     pub keys: KeyConfig,
 }
@@ -374,6 +376,7 @@ impl AppState {
             deleted_this_session: false,
             ghost_text: None,
             completion_hint: None,
+            jj: None,
             nerd_font: false,
             help_hint_shown: false,
             last_repeatable: None,
@@ -816,6 +819,14 @@ fn try_reorder_card(
     )))
 }
 
+/// Give a just-moved card its jj change in the background, if the jj
+/// integration is on and the card landed in In Progress.
+fn start_jj_change(board: &Board, state: &AppState, card_id: &str) {
+    if let Some(job) = state.jj.as_ref().and_then(|jj| jj.job_for_move(board, card_id)) {
+        job.spawn();
+    }
+}
+
 /// Try to move the selected card to an adjacent visible column.
 /// Returns `Ok(Some(sync_msg))` if the card was moved, `Ok(None)` if WIP confirmation
 /// was triggered or no move was possible.
@@ -865,6 +876,7 @@ fn try_move_card(
     save_board(kando_dir, board)?;
     append_activity(kando_dir, "move", &card_id, &card_title,
         &[("from", &from_name), ("to", &to_name)]);
+    start_jj_change(board, state, &card_id);
     state.notify("Card moved");
     Ok(Some(format!("Move card #{card_id} \"{card_title}\" from {from_name} to {to_name}")))
 }
@@ -928,6 +940,7 @@ pub fn run(terminal: &mut DefaultTerminal, start_dir: &std::path::Path, nerd_fon
     let mut local_cfg = match load_local_config(kando_dir) {
         Ok(cfg) => {
             state.help_hint_shown = cfg.help_hint_shown;
+            state.jj = kando_core::board::jj::JjSettings::from_config(&cfg, &ctx.project_root);
             cfg
         }
         Err(e) => {
@@ -1451,6 +1464,7 @@ fn handle_repeat_last(
             save_board(kando_dir, board)?;
             append_activity(kando_dir, "move", &card_id, &card_title,
                 &[("from", &from_name), ("to", &to_name)]);
+            start_jj_change(board, state, &card_id);
             state.notify(format!("Moved to {to_name}"));
             return Ok(Some(format!("Move card #{card_id} \"{card_title}\" from {from_name} to {to_name}")));
         }
@@ -3601,6 +3615,7 @@ fn handle_input_confirm(
                             save_board(kando_dir, board)?;
                             append_activity(kando_dir, "move", &card_id, &card_title,
                                 &[("from", &from_name), ("to", &to_name)]);
+                            start_jj_change(board, state, &card_id);
                             sync_message = Some(format!("Move card #{card_id} \"{card_title}\" from {from_name} to {to_name}"));
                             state.last_repeatable = Some(RepeatableAction::MoveToColumn {
                                 column_slug: to_slug,
@@ -3879,6 +3894,7 @@ fn handle_confirm(
                     save_board(kando_dir, board)?;
                     append_activity(kando_dir, "move", &card_id, &card_title,
                         &[("from", &from_name), ("to", &to_name)]);
+                    start_jj_change(board, state, &card_id);
                     sync_message = Some(format!("Move card #{card_id} \"{card_title}\" from {from_name} to {to_name}"));
                     state.last_repeatable = Some(RepeatableAction::MoveCard { forward: to > from });
                     state.notify("Card moved");

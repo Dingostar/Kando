@@ -2045,7 +2045,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_board(dir.path(), "Test", None).unwrap();
         let kando_dir = dir.path().join(".kando");
-        let cfg = crate::config::LocalConfig { help_hint_shown: true };
+        let cfg = crate::config::LocalConfig { help_hint_shown: true, ..Default::default() };
         save_local_config(&kando_dir, &cfg).unwrap();
         let loaded = load_local_config(&kando_dir).unwrap();
         assert!(loaded.help_hint_shown);

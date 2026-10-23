@@ -296,7 +296,9 @@ fn run_hook(
     }
 }
 
-fn send_notification(notif: HookNotification) {
+/// Forward a notification to the TUI, if one is listening. Also used by
+/// built-in integrations (see [`super::jj`]) that report the same way hooks do.
+pub fn send_notification(notif: HookNotification) {
     if let Ok(guard) = hook_tx().lock() {
         if let Some(ref tx) = *guard {
             let _ = tx.send(notif);

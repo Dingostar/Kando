@@ -28,11 +28,33 @@ pub struct LocalConfig {
     /// Whether the first-launch help hint has been shown.
     #[serde(default, alias = "tutorial_shown")]
     pub help_hint_shown: bool,
+    /// Give cards a jj change when they enter In Progress (`kando jj on`).
+    #[serde(default)]
+    pub jj: bool,
+    /// Revset a card's change starts from when none of its blockers has one.
+    /// `None` means [`crate::board::jj::DEFAULT_BASE`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jj_base: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_config_jj_roundtrip() {
+        let original = LocalConfig { jj: true, jj_base: Some("trunk()".into()), ..Default::default() };
+        let loaded: LocalConfig = toml::from_str(&toml::to_string_pretty(&original).unwrap()).unwrap();
+        assert!(loaded.jj);
+        assert_eq!(loaded.jj_base.as_deref(), Some("trunk()"));
+    }
+
+    #[test]
+    fn local_config_jj_defaults_off() {
+        let loaded: LocalConfig = toml::from_str("help_hint_shown = true\n").unwrap();
+        assert!(!loaded.jj);
+        assert!(loaded.jj_base.is_none());
+    }
 
     #[test]
     fn local_config_default_creates_empty_struct() {
@@ -64,7 +86,7 @@ mod tests {
 
     #[test]
     fn local_config_help_hint_shown_true_roundtrip() {
-        let original = LocalConfig { help_hint_shown: true };
+        let original = LocalConfig { help_hint_shown: true, ..Default::default() };
         let serialized = toml::to_string_pretty(&original).unwrap();
         let loaded: LocalConfig = toml::from_str(&serialized).unwrap();
         assert!(loaded.help_hint_shown);
@@ -84,7 +106,7 @@ mod tests {
 
     #[test]
     fn local_config_serializes_with_new_field_name_not_alias() {
-        let cfg = LocalConfig { help_hint_shown: true };
+        let cfg = LocalConfig { help_hint_shown: true, ..Default::default() };
         let serialized = toml::to_string_pretty(&cfg).unwrap();
         assert!(serialized.contains("help_hint_shown"));
         assert!(!serialized.contains("tutorial_shown"));
