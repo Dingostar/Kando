@@ -172,6 +172,7 @@ pub enum InputTarget {
     DueDate,
     TemplateRename(String), // holds old slug
     BlockedBy,
+    BlockFilter,
 }
 
 #[derive(Debug, Clone)]
@@ -311,6 +312,8 @@ pub struct AppState {
     pub active_assignee_filters: Vec<String>,
     pub active_staleness_filters: Vec<String>,
     pub active_overdue_filter: bool,
+    /// Card ID whose block tree (`fb`) limits the visible cards.
+    pub active_block_filter: Option<String>,
     pub notification: Option<String>,
     pub notification_level: NotificationLevel,
     pub notification_expires: Option<Instant>,
@@ -367,6 +370,7 @@ impl AppState {
             active_assignee_filters: Vec::new(),
             active_staleness_filters: Vec::new(),
             active_overdue_filter: false,
+            active_block_filter: None,
             notification: None,
             notification_level: NotificationLevel::Info,
             notification_expires: None,
@@ -453,6 +457,7 @@ impl AppState {
             || !self.active_assignee_filters.is_empty()
             || !self.active_staleness_filters.is_empty()
             || self.active_overdue_filter
+            || self.active_block_filter.is_some()
     }
 
     /// Clamp selection to the nearest visible card under active filters.
@@ -504,25 +509,32 @@ impl AppState {
     }
 }
 
+/// IDs the block-tree filter (`fb`) lets through, or `None` when it is off.
+pub fn block_filter_ids(state: &AppState, board: &Board) -> Option<std::collections::HashSet<String>> {
+    state.active_block_filter.as_deref().map(|id| board.block_tree(id))
+}
+
 /// Return the unfiltered indices of cards visible under the current filters.
 fn visible_card_indices(col: &Column, state: &AppState, board: &Board) -> Vec<usize> {
     let matcher = SkimMatcherV2::default();
     let now = Utc::now();
+    let block_ids = block_filter_ids(state, board);
     col.cards
         .iter()
         .enumerate()
         .filter(|(_, card)| {
-            kando_core::board::card_is_visible(
-                card,
-                state.active_filter.as_deref(),
-                &state.active_tag_filters,
-                &state.active_assignee_filters,
-                &state.active_staleness_filters,
-                state.active_overdue_filter,
-                &board.policies,
-                now,
-                &matcher,
-            )
+            block_ids.as_ref().is_none_or(|ids| ids.contains(&card.id))
+                && kando_core::board::card_is_visible(
+                    card,
+                    state.active_filter.as_deref(),
+                    &state.active_tag_filters,
+                    &state.active_assignee_filters,
+                    &state.active_staleness_filters,
+                    state.active_overdue_filter,
+                    &board.policies,
+                    now,
+                    &matcher,
+                )
         })
         .map(|(i, _)| i)
         .collect()
@@ -632,23 +644,25 @@ fn jump_to_visible_card(board: &Board, state: &mut AppState, forward: bool) {
     // Collect all (col_idx, card_idx) pairs for visible cards across all columns.
     let matcher = SkimMatcherV2::default();
     let now = Utc::now();
+    let block_ids = block_filter_ids(state, board);
     let mut all_visible: Vec<(usize, usize)> = Vec::new();
     for (ci, col) in board.columns.iter().enumerate() {
         if col.hidden && !state.show_hidden_columns {
             continue;
         }
         for (cardi, card) in col.cards.iter().enumerate() {
-            if kando_core::board::card_is_visible(
-                card,
-                state.active_filter.as_deref(),
-                &state.active_tag_filters,
-                &state.active_assignee_filters,
-                &state.active_staleness_filters,
-                state.active_overdue_filter,
-                &board.policies,
-                now,
-                &matcher,
-            ) {
+            if block_ids.as_ref().is_none_or(|ids| ids.contains(&card.id))
+                && kando_core::board::card_is_visible(
+                    card,
+                    state.active_filter.as_deref(),
+                    &state.active_tag_filters,
+                    &state.active_assignee_filters,
+                    &state.active_staleness_filters,
+                    state.active_overdue_filter,
+                    &board.policies,
+                    now,
+                    &matcher,
+                ) {
                 all_visible.push((ci, cardi));
             }
         }
@@ -1292,7 +1306,7 @@ fn process_action(
         }
 
         // Filter / tag filter
-        Action::StartFilter | Action::StartTagFilter | Action::StartAssigneeFilter | Action::StartStalenessFilter | Action::StartOverdueFilter => {
+        Action::StartFilter | Action::StartTagFilter | Action::StartAssigneeFilter | Action::StartStalenessFilter | Action::StartOverdueFilter | Action::StartBlockFilter => {
             handle_filter_start(board, state, action);
         }
 
@@ -1370,6 +1384,7 @@ fn process_action(
                 state.active_assignee_filters.clear();
                 state.active_staleness_filters.clear();
                 state.active_overdue_filter = false;
+                state.active_block_filter = None;
                 state.notify("Filters cleared");
             }
         }
@@ -2559,6 +2574,14 @@ fn handle_filter_start(board: &Board, state: &mut AppState, action: Action) {
                 "Overdue filter off"
             });
         }
+        Action::StartBlockFilter => {
+            state.mode = Mode::Input {
+                prompt: "Block tree of card ID",
+                buf: TextBuffer::new(state.active_block_filter.clone().unwrap_or_default()),
+                on_confirm: InputTarget::BlockFilter,
+                completion: None,
+            };
+        }
         _ => unreachable!(),
     }
 }
@@ -3265,6 +3288,35 @@ fn handle_input_confirm(
             sync_message = Some(format!("Update assignees on #{card_id} \"{card_title}\""));
             state.clamp_selection_filtered(board);
             state.notify("Assignees updated");
+        }
+        Mode::Input {
+            prompt,
+            buf,
+            on_confirm: InputTarget::BlockFilter,
+            completion,
+        } => {
+            let id = buf.input.trim().trim_start_matches('#').to_string();
+            if id.is_empty() {
+                state.active_block_filter = None;
+                state.clamp_selection_filtered(board);
+                state.notify("Block filter off");
+            } else if let Some((col, idx)) = board.find_card(&id) {
+                state.active_block_filter = Some(id);
+                // Land on the card the tree was built from, if it is on screen.
+                let shown = (state.show_hidden_columns || !board.columns[col].hidden)
+                    && visible_card_indices(&board.columns[col], state, board).contains(&idx);
+                if shown {
+                    state.focused_column = col;
+                    state.selected_card = idx;
+                } else {
+                    state.clamp_selection_filtered(board);
+                    jump_to_visible_card(board, state, true);
+                }
+            } else {
+                // Keep the prompt open so the ID can be fixed.
+                state.mode = Mode::Input { prompt, buf, on_confirm: InputTarget::BlockFilter, completion };
+                state.notify_error(format!("No card with ID {id}"));
+            }
         }
         Mode::Input {
             buf,
@@ -5789,6 +5841,77 @@ mod tests {
         handle_card_action(&mut board, &mut state, Action::OpenCardDetail, &mut terminal, fake_dir(), false).unwrap();
         assert!(matches!(state.mode, Mode::CardDetail { .. }));
         assert!(state.notification.is_none());
+    }
+
+    // ── block-tree filter (fb) ──
+
+    /// Chain 0000 <- 0001 <- 0002 <- 0003 in column A, a sibling 0004 also
+    /// blocked by 0000, and an unrelated 0100 in column B.
+    fn block_chain_board() -> Board {
+        let mut board = test_board(&[("A", &["a", "b", "c", "d", "e"]), ("B", &["f"])]);
+        let cards = &mut board.columns[0].cards;
+        cards[1].blocked_by = vec!["0000".into()];
+        cards[2].blocked_by = vec!["0001".into()];
+        cards[3].blocked_by = vec!["0002".into()];
+        cards[4].blocked_by = vec!["0000".into()];
+        board
+    }
+
+    fn confirm_block_filter(board: &mut Board, state: &mut AppState, input: &str) {
+        handle_filter_start(board, state, Action::StartBlockFilter);
+        if let Mode::Input { buf, .. } = &mut state.mode {
+            *buf = TextBuffer::new(input.into());
+        }
+        handle_input_confirm(board, state, fake_dir()).unwrap();
+    }
+
+    #[test]
+    fn block_filter_shows_ancestors_and_descendants_only() {
+        let mut board = block_chain_board();
+        let mut state = AppState::new();
+        confirm_block_filter(&mut board, &mut state, "0002");
+        assert_eq!(state.active_block_filter.as_deref(), Some("0002"));
+        assert!(matches!(state.mode, Mode::Normal));
+        assert_eq!(visible_card_indices(&board.columns[0], &state, &board), vec![0, 1, 2, 3]);
+        assert!(visible_card_indices(&board.columns[1], &state, &board).is_empty());
+        // Selection lands on the card the tree was built from.
+        assert_eq!((state.focused_column, state.selected_card), (0, 2));
+    }
+
+    #[test]
+    fn block_filter_matches_id_exactly() {
+        let mut board = block_chain_board();
+        let mut state = AppState::new();
+        // "000" is a prefix of every ID in column A but is not itself a card.
+        confirm_block_filter(&mut board, &mut state, "000");
+        assert!(state.active_block_filter.is_none());
+        assert!(matches!(state.mode, Mode::Input { on_confirm: InputTarget::BlockFilter, .. }));
+        assert!(state.notification.as_deref().unwrap().contains("No card with ID 000"));
+    }
+
+    #[test]
+    fn block_filter_accepts_hash_and_empty_clears() {
+        let mut board = block_chain_board();
+        let mut state = AppState::new();
+        confirm_block_filter(&mut board, &mut state, "#0004");
+        assert_eq!(state.active_block_filter.as_deref(), Some("0004"));
+        assert_eq!(visible_card_indices(&board.columns[0], &state, &board), vec![0, 4]);
+        confirm_block_filter(&mut board, &mut state, "");
+        assert!(state.active_block_filter.is_none());
+        assert!(!state.has_active_filter());
+    }
+
+    #[test]
+    fn block_filter_combines_with_text_filter() {
+        let mut board = block_chain_board();
+        let mut state = AppState::new();
+        confirm_block_filter(&mut board, &mut state, "0002");
+        state.active_filter = Some("b".into());
+        assert_eq!(visible_card_indices(&board.columns[0], &state, &board), vec![1]);
+        state.active_filter = Some("e".into());
+        assert!(visible_card_indices(&board.columns[0], &state, &board).is_empty());
+        state.active_filter = None;
+        assert!(state.has_active_filter(), "block filter alone counts as a filter");
     }
 
     // ── the selection follows a card across columns ──

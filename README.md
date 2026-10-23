@@ -162,6 +162,11 @@ The hint is color-coded by risk: destructive actions (delete, remove column) app
 - `a` - Filter by assignee
 - `s` - Filter by staleness
 - `d` - Filter by overdue
+- `b` - Filter by block tree: enter a card ID (exact) to show that card, every
+  card it is transitively blocked by, and every card it transitively blocks.
+  For a chain `1 <- 10 <- 52 <- 60 <- 72`, entering `52` shows all five cards.
+  Other dependents of its blockers (siblings) are not shown. Finished blockers
+  are included. Leave the ID empty to turn it off.
 - `Esc` - Clear filters
 
 Filters can be combined. For example, you can filter to show only cards tagged `bug` assigned to `alice`.

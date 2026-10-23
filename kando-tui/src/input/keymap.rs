@@ -255,6 +255,7 @@ fn map_filter_menu(key: KeyEvent) -> Action {
         KeyCode::Char('a') => Action::StartAssigneeFilter,
         KeyCode::Char('s') => Action::StartStalenessFilter,
         KeyCode::Char('d') => Action::StartOverdueFilter,
+        KeyCode::Char('b') => Action::StartBlockFilter,
         KeyCode::Char('/') => Action::StartFilter,
         KeyCode::Esc => Action::None,
         _ => Action::None,
@@ -371,6 +372,7 @@ pub const FILTER_BINDINGS: &[Binding] = &[
     Binding { key: "a", description: "By assignee" },
     Binding { key: "s", description: "By staleness" },
     Binding { key: "d", description: "By overdue" },
+    Binding { key: "b", description: "By block tree (card ID)" },
     Binding { key: "/", description: "Text search" },
 ];
 
@@ -1243,6 +1245,12 @@ mod tests {
     fn filter_menu_d_starts_overdue_filter() {
         let action = map_key(key(KeyCode::Char('d')), &Mode::FilterMenu);
         assert_eq!(action, Action::StartOverdueFilter);
+    }
+
+    #[test]
+    fn filter_menu_b_starts_block_filter() {
+        let action = map_key(key(KeyCode::Char('b')), &Mode::FilterMenu);
+        assert_eq!(action, Action::StartBlockFilter);
     }
 
     #[test]

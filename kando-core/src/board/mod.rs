@@ -383,6 +383,51 @@ impl Board {
             .collect()
     }
 
+    /// The block tree of `id`: the card itself, every card it is
+    /// (transitively) blocked by, and every card it (transitively) blocks.
+    /// Siblings — other dependents of an ancestor, other blockers of a
+    /// descendant — are not included. Empty when no card has that exact ID.
+    ///
+    /// Follows every `blocked_by` edge, resolved or not.
+    pub fn block_tree(&self, id: &str) -> std::collections::HashSet<String> {
+        let mut tree = std::collections::HashSet::new();
+        if self.find_card(id).is_none() {
+            return tree;
+        }
+        tree.insert(id.to_string());
+
+        let cards = || self.columns.iter().flat_map(|col| &col.cards);
+        let blockers: std::collections::HashMap<&str, &[String]> =
+            cards().map(|c| (c.id.as_str(), c.blocked_by.as_slice())).collect();
+        let mut dependents: std::collections::HashMap<&str, Vec<&str>> =
+            std::collections::HashMap::new();
+        for card in cards() {
+            for b in &card.blocked_by {
+                dependents.entry(b.as_str()).or_default().push(card.id.as_str());
+            }
+        }
+
+        // Walk up through blockers.
+        let mut stack = vec![id];
+        while let Some(cur) = stack.pop() {
+            for b in blockers.get(cur).copied().unwrap_or_default() {
+                if tree.insert(b.clone()) {
+                    stack.push(b);
+                }
+            }
+        }
+        // Walk down through dependents.
+        let mut stack = vec![id];
+        while let Some(cur) = stack.pop() {
+            for &d in dependents.get(cur).map(Vec::as_slice).unwrap_or_default() {
+                if tree.insert(d.to_string()) {
+                    stack.push(d);
+                }
+            }
+        }
+        tree
+    }
+
     /// Look for a blocker cycle through `card_id`, as if its `blocked_by` were
     /// `proposed`. Returns the cycle as a path that starts and ends at
     /// `card_id` (e.g. `["3", "2", "3"]`), or `None` if there is none.
@@ -2074,6 +2119,37 @@ mod tests {
         let mut board = blocker_board();
         board.policies.auto_close_target = "in-progress".into();
         assert!(board.blocker_is_resolved("4"));
+    }
+
+    #[test]
+    fn block_tree_follows_ancestors_and_descendants_not_siblings() {
+        // Chain 1 <- 2 <- 3 <- 4 <- 5, plus a sibling 6 also blocked by 2,
+        // and 3 also blocked by an unrelated 7 (with 7 blocked by nothing).
+        let mut board = blocker_board();
+        board.columns[0].cards.push(Card::new("7".into(), "Card 7".into()));
+        card_mut(&mut board, "2").blocked_by = vec!["1".into()];
+        card_mut(&mut board, "3").blocked_by = vec!["2".into(), "7".into()];
+        card_mut(&mut board, "4").blocked_by = vec!["3".into()];
+        card_mut(&mut board, "5").blocked_by = vec!["4".into()];
+        card_mut(&mut board, "6").blocked_by = vec!["2".into()];
+
+        let tree = board.block_tree("4");
+        let mut ids: Vec<_> = tree.iter().map(String::as_str).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["1", "2", "3", "4", "5", "7"]);
+
+        // 6 is a dependent of 2 but not on 3's path: a sibling, excluded.
+        let tree = board.block_tree("3");
+        assert!(!tree.contains("6"));
+        assert!(tree.contains("5"), "resolved (done) cards are still followed");
+    }
+
+    #[test]
+    fn block_tree_is_exact_id_and_empty_for_unknown() {
+        let board = blocker_board();
+        assert!(board.block_tree("99").is_empty());
+        assert!(board.block_tree("").is_empty());
+        assert_eq!(board.block_tree("1").len(), 1);
     }
 
     #[test]

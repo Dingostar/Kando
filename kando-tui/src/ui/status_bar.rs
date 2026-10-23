@@ -91,6 +91,14 @@ fn build_left_zone(state: &AppState) -> Vec<Span<'_>> {
         ));
     }
 
+    // Show active block-tree filter
+    if let Some(ref id) = state.active_block_filter {
+        spans.push(Span::styled(
+            format!("blocks:{id} "),
+            Style::default().fg(Theme::FG),
+        ));
+    }
+
     // Show active staleness filters
     if !state.active_staleness_filters.is_empty() {
         let labels = state.active_staleness_filters.join(",");
@@ -358,6 +366,14 @@ mod tests {
         state.active_staleness_filters = vec!["stale".to_string(), "very stale".to_string()];
         let spans = build_left_zone(&state);
         assert!(span_texts(&spans).contains(&"[stale,very stale] "));
+    }
+
+    #[test]
+    fn left_zone_shows_block_filter() {
+        let mut state = AppState::new();
+        state.active_block_filter = Some("52".to_string());
+        let spans = build_left_zone(&state);
+        assert!(span_texts(&spans).contains(&"blocks:52 "));
     }
 
     #[test]

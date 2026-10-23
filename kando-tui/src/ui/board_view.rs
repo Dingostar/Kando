@@ -145,23 +145,26 @@ fn render_column(
     matcher: &SkimMatcherV2,
     icons: &Icons,
 ) {
-    // Text search (/) takes precedence; tag/assignee/staleness picker filters apply otherwise
+    // Text search (/) takes precedence; tag/assignee/staleness picker filters apply otherwise.
+    // The block-tree filter (fb) applies on top of either.
+    let block_ids = crate::app::block_filter_ids(state, board);
     let cards: Vec<(usize, &Card)> = col
         .cards
         .iter()
         .enumerate()
         .filter(|(_, card)| {
-            kando_core::board::card_is_visible(
-                card,
-                state.active_filter.as_deref(),
-                &state.active_tag_filters,
-                &state.active_assignee_filters,
-                &state.active_staleness_filters,
-                state.active_overdue_filter,
-                &board.policies,
-                now,
-                matcher,
-            )
+            block_ids.as_ref().is_none_or(|ids| ids.contains(&card.id))
+                && kando_core::board::card_is_visible(
+                    card,
+                    state.active_filter.as_deref(),
+                    &state.active_tag_filters,
+                    &state.active_assignee_filters,
+                    &state.active_staleness_filters,
+                    state.active_overdue_filter,
+                    &board.policies,
+                    now,
+                    matcher,
+                )
         })
         .collect();
 

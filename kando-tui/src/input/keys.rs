@@ -334,6 +334,7 @@ fn parse_action(name: &str) -> Option<Option<Action>> {
         "start_assignee_filter" => Action::StartAssigneeFilter,
         "start_staleness_filter" => Action::StartStalenessFilter,
         "start_overdue_filter" => Action::StartOverdueFilter,
+        "start_block_filter" => Action::StartBlockFilter,
         "find_next" => Action::FindNext,
         "find_prev" => Action::FindPrev,
         "clear_filters" => Action::ClearFilters,

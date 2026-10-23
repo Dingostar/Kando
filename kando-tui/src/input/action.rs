@@ -67,6 +67,7 @@ pub enum Action {
     StartAssigneeFilter,
     StartStalenessFilter,
     StartOverdueFilter,
+    StartBlockFilter,
     EnterFilterMode,
     FindNext,
     FindPrev,
