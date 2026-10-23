@@ -152,7 +152,7 @@ fn build_concepts(lines: &mut Vec<Line<'static>>, key: Style, dim: Style) {
         dim,
     )));
     lines.push(Line::from(Span::styled(
-        "assignees, blocker status (with optional reason), and",
+        "assignees, the cards it is blocked by, and",
         dim,
     )));
     lines.push(Line::from(Span::styled(

@@ -125,7 +125,7 @@ pub fn render_board(f: &mut Frame, area: Rect, board: &Board, state: &AppState, 
             col,
             is_focused,
             state,
-            &board.policies,
+            board,
             now,
             &matcher,
             icons,
@@ -140,7 +140,7 @@ fn render_column(
     col: &kando_core::board::Column,
     is_focused: bool,
     state: &AppState,
-    policies: &kando_core::board::Policies,
+    board: &Board,
     now: chrono::DateTime<Utc>,
     matcher: &SkimMatcherV2,
     icons: &Icons,
@@ -158,7 +158,7 @@ fn render_column(
                 &state.active_assignee_filters,
                 &state.active_staleness_filters,
                 state.active_overdue_filter,
-                policies,
+                &board.policies,
                 now,
                 matcher,
             )
@@ -279,10 +279,10 @@ fn render_column(
         let is_selected = is_focused && state.selected_card == real_idx;
         if state.compact {
             render_compact_card(
-                f, card_area, card, is_selected, is_focused, policies, now, icons,
+                f, card_area, card, board.is_blocked(card), is_selected, is_focused, &board.policies, now, icons,
             );
         } else {
-            render_card(f, card_area, card, is_selected, is_focused, policies, now, icons);
+            render_card(f, card_area, card, board.is_blocked(card), is_selected, is_focused, &board.policies, now, icons);
         }
         y += height;
     }
@@ -338,6 +338,7 @@ fn render_compact_card(
     f: &mut Frame,
     area: Rect,
     card: &Card,
+    is_blocked: bool,
     is_selected: bool,
     is_col_focused: bool,
     policies: &kando_core::board::Policies,
@@ -365,7 +366,7 @@ fn render_compact_card(
     if is_overdue {
         glyphs.push((icons.overdue, Style::default().fg(Theme::OVERDUE)));
     }
-    if card.is_blocked() {
+    if is_blocked {
         glyphs.push((icons.blocker, Style::default().fg(Theme::BLOCKER)));
     }
 
@@ -478,6 +479,7 @@ fn render_card(
     f: &mut Frame,
     area: Rect,
     card: &Card,
+    is_blocked: bool,
     is_selected: bool,
     is_col_focused: bool,
     policies: &kando_core::board::Policies,
@@ -497,7 +499,7 @@ fn render_card(
     let selected_mod = if is_selected { Modifier::BOLD } else { Modifier::empty() };
 
     let border_style =
-        card_border_style(card.is_blocked(), is_overdue, is_col_focused, stale, is_new)
+        card_border_style(is_blocked, is_overdue, is_col_focused, stale, is_new)
             .add_modifier(selected_mod);
 
     let block = Block::default()
@@ -534,7 +536,7 @@ fn render_card(
     if is_overdue {
         candidates.push((icons.overdue, Style::default().fg(Theme::OVERDUE)));
     }
-    if card.is_blocked() {
+    if is_blocked {
         candidates.push((icons.blocker, Style::default().fg(Theme::BLOCKER)));
     }
 

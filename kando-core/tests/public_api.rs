@@ -6,7 +6,6 @@ fn re_export_board_types_accessible() {
         priority: kando_core::Priority::Normal,
         tags: vec![],
         assignees: vec![],
-        blocked: None,
         due_offset_days: None,
         body: String::new(),
     };

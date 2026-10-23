@@ -10,9 +10,9 @@ use fuzzy_matcher::FuzzyMatcher;
 use serde::{Deserialize, Deserializer, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
-/// Deserialize `blocked` from either a TOML bool or a string.
+/// Deserialize the legacy free-text `blocked` field from either a TOML bool or a string.
 /// `true` → `Some("")`, `false` / absent → `None`, `"reason"` → `Some("reason")`.
-fn deserialize_blocked<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+fn deserialize_legacy_blocked<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum BoolOrString {
@@ -170,8 +170,21 @@ pub struct Card {
     pub tags: Vec<String>,
     #[serde(default)]
     pub assignees: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_blocked", skip_serializing_if = "Option::is_none")]
-    pub blocked: Option<String>,
+    /// IDs of the cards this card is blocked by. The reverse edge ("is
+    /// blocking") is derived by [`Board::is_blocking`], never stored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by: Vec<String>,
+    /// The free-text `blocked` reason from before blockers referenced cards.
+    /// It no longer blocks anything; it is kept (and written back) only so the
+    /// note isn't lost silently, and `kando doctor` reports it until it is
+    /// replaced with card IDs. Setting `blocked_by` clears it.
+    #[serde(
+        default,
+        rename = "blocked",
+        deserialize_with = "deserialize_legacy_blocked",
+        skip_serializing
+    )]
+    pub legacy_blocked: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due: Option<NaiveDate>,
     /// When the card first moved past backlog (commitment point). `None` for cards still in backlog.
@@ -195,12 +208,24 @@ pub struct Template {
     pub tags: Vec<String>,
     #[serde(default)]
     pub assignees: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_blocked", skip_serializing_if = "Option::is_none")]
-    pub blocked: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due_offset_days: Option<u32>,
     #[serde(skip)]
     pub body: String,
+}
+
+/// Parse a comma-separated list of card IDs, as typed into the blocker editor
+/// or `--blocked-by`. Trims whitespace, accepts a leading `#`, drops empty
+/// entries and duplicates (keeping first-seen order).
+pub fn parse_card_ids(input: &str) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for part in input.split(',') {
+        let id = part.trim().trim_start_matches('#').trim();
+        if !id.is_empty() && !ids.iter().any(|i| i == id) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
 }
 
 /// Generate a filesystem-safe slug for a template name, unique among `existing_slugs`.
@@ -235,16 +260,13 @@ impl Card {
             order: None,
             tags: Vec::new(),
             assignees: Vec::new(),
-            blocked: None,
+            blocked_by: Vec::new(),
+            legacy_blocked: None,
             due: None,
             started: None,
             completed: None,
             body: "<!-- add body content here -->".into(),
         }
-    }
-
-    pub fn is_blocked(&self) -> bool {
-        self.blocked.is_some()
     }
 
     /// Whether this card is past its due date.
@@ -318,6 +340,117 @@ impl Board {
             card.completed = None;
         }
         self.columns[to_col].cards.push(card);
+    }
+
+    /// Whether a blocker has stopped holding anything back: it is done,
+    /// archived (or in the auto-close target column), or gone from the board.
+    ///
+    /// Blocking is derived from where the blocker sits *now*, so nothing
+    /// cascades on move/archive/delete and moving a blocker back out of Done
+    /// re-blocks its dependents.
+    pub fn blocker_is_resolved(&self, id: &str) -> bool {
+        match self.find_card(id) {
+            None => true,
+            Some((col, _)) => {
+                let slug = self.columns[col].slug.as_str();
+                slug == "done" || slug == "archive" || slug == self.policies.auto_close_target
+            }
+        }
+    }
+
+    /// Blocker IDs that are still holding this card back.
+    pub fn active_blockers<'a>(&self, card: &'a Card) -> Vec<&'a str> {
+        card.blocked_by
+            .iter()
+            .map(String::as_str)
+            .filter(|id| !self.blocker_is_resolved(id))
+            .collect()
+    }
+
+    /// Whether the card has at least one unresolved blocker.
+    pub fn is_blocked(&self, card: &Card) -> bool {
+        card.blocked_by.iter().any(|id| !self.blocker_is_resolved(id))
+    }
+
+    /// Derived reverse edge: IDs of the cards that list `id` in `blocked_by`.
+    pub fn is_blocking(&self, id: &str) -> Vec<String> {
+        self.columns
+            .iter()
+            .flat_map(|col| &col.cards)
+            .filter(|card| card.blocked_by.iter().any(|b| b == id))
+            .map(|card| card.id.clone())
+            .collect()
+    }
+
+    /// Look for a blocker cycle through `card_id`, as if its `blocked_by` were
+    /// `proposed`. Returns the cycle as a path that starts and ends at
+    /// `card_id` (e.g. `["3", "2", "3"]`), or `None` if there is none.
+    ///
+    /// Carries a visited set, so cycles elsewhere in the graph can't hang it.
+    pub fn find_blocker_cycle(&self, card_id: &str, proposed: &[String]) -> Option<Vec<String>> {
+        let blockers_of = |id: &str| -> Vec<String> {
+            if id == card_id {
+                return proposed.to_vec();
+            }
+            match self.find_card(id) {
+                Some((c, k)) => self.columns[c].cards[k].blocked_by.clone(),
+                None => Vec::new(),
+            }
+        };
+        let mut visited = std::collections::HashSet::new();
+        // Each stack entry is a path from card_id; extend it depth-first.
+        let mut stack: Vec<Vec<String>> = proposed
+            .iter()
+            .rev()
+            .map(|b| vec![card_id.to_string(), b.clone()])
+            .collect();
+        while let Some(path) = stack.pop() {
+            let last = path.last().expect("path is never empty").clone();
+            if last == card_id {
+                return Some(path);
+            }
+            if !visited.insert(last.clone()) {
+                continue;
+            }
+            for next in blockers_of(&last).into_iter().rev() {
+                let mut p = path.clone();
+                p.push(next);
+                stack.push(p);
+            }
+        }
+        None
+    }
+
+    /// Every distinct blocker cycle on the board, for `kando doctor`.
+    pub fn blocker_cycles(&self) -> Vec<Vec<String>> {
+        let mut seen: Vec<std::collections::BTreeSet<String>> = Vec::new();
+        let mut cycles = Vec::new();
+        for card in self.columns.iter().flat_map(|col| &col.cards) {
+            if let Some(cycle) = self.find_blocker_cycle(&card.id, &card.blocked_by) {
+                let members: std::collections::BTreeSet<String> = cycle.iter().cloned().collect();
+                if !seen.contains(&members) {
+                    seen.push(members);
+                    cycles.push(cycle);
+                }
+            }
+        }
+        cycles
+    }
+
+    /// Validate a proposed `blocked_by` list for `card_id`: every ID must be
+    /// another card on the board, and the result must not create a cycle.
+    /// Returns a user-facing message on failure.
+    pub fn validate_blocked_by(&self, card_id: &str, ids: &[String]) -> Result<(), String> {
+        if ids.iter().any(|id| id == card_id) {
+            return Err("A card cannot block itself".into());
+        }
+        if let Some(missing) = ids.iter().find(|id| self.find_card(id).is_none()) {
+            return Err(format!("No card with ID {missing}"));
+        }
+        if let Some(cycle) = self.find_blocker_cycle(card_id, ids) {
+            return Err(format!("Cycle: {}", cycle.join(" -> ")));
+        }
+        Ok(())
     }
 
     /// Collect all unique tags across the board with counts.
@@ -1223,7 +1356,8 @@ mod tests {
         assert_eq!(c.priority, Priority::Normal);
         assert!(c.tags.is_empty());
         assert!(c.assignees.is_empty());
-        assert!(!c.is_blocked());
+        assert!(c.blocked_by.is_empty());
+        assert!(c.legacy_blocked.is_none());
         assert!(c.started.is_none());
         assert!(c.completed.is_none());
         assert_eq!(c.body, "<!-- add body content here -->");
@@ -1388,7 +1522,7 @@ mod tests {
         normal.priority = Priority::Normal;
         let mut blocked = Card::new("2".into(), "Blocked".into());
         blocked.priority = Priority::Normal;
-        blocked.blocked = Some(String::new());
+        blocked.blocked_by = vec!["1".into()];
         col.cards = vec![normal, blocked];
         col.sort_cards();
         // Both Normal priority, but sort is by priority then updated; blocked doesn't affect sort
@@ -1850,89 +1984,226 @@ mod tests {
         assert_eq!(generate_template_slug("", &existing), "template-2");
     }
 
-    // ── deserialize_blocked tests ──
+    // ── legacy `blocked` field ──
 
-    #[test]
-    fn deserialize_blocked_true_yields_some_empty() {
-        let toml_str = r#"
-id = "1"
-title = "T"
-created = "2025-01-01T00:00:00Z"
-updated = "2025-01-01T00:00:00Z"
-blocked = true
-"#;
-        let card: Card = toml::from_str(toml_str).unwrap();
-        assert_eq!(card.blocked, Some(String::new()));
+    fn card_toml(extra: &str) -> String {
+        format!(
+            "id = \"1\"\ntitle = \"T\"\ncreated = \"2025-01-01T00:00:00Z\"\nupdated = \"2025-01-01T00:00:00Z\"\n{extra}"
+        )
     }
 
     #[test]
-    fn deserialize_blocked_false_yields_none() {
-        let toml_str = r#"
-id = "1"
-title = "T"
-created = "2025-01-01T00:00:00Z"
-updated = "2025-01-01T00:00:00Z"
-blocked = false
-"#;
-        let card: Card = toml::from_str(toml_str).unwrap();
-        assert!(card.blocked.is_none());
+    fn legacy_blocked_string_loads_as_legacy_note() {
+        let card: Card = toml::from_str(&card_toml("blocked = \"waiting for 1\"\n")).unwrap();
+        assert_eq!(card.legacy_blocked.as_deref(), Some("waiting for 1"));
+        assert!(card.blocked_by.is_empty());
     }
 
     #[test]
-    fn deserialize_blocked_absent_yields_none() {
-        let toml_str = r#"
-id = "1"
-title = "T"
-created = "2025-01-01T00:00:00Z"
-updated = "2025-01-01T00:00:00Z"
-"#;
-        let card: Card = toml::from_str(toml_str).unwrap();
-        assert!(card.blocked.is_none());
+    fn legacy_blocked_true_and_false() {
+        let t: Card = toml::from_str(&card_toml("blocked = true\n")).unwrap();
+        assert_eq!(t.legacy_blocked.as_deref(), Some(""));
+        let f: Card = toml::from_str(&card_toml("blocked = false\n")).unwrap();
+        assert!(f.legacy_blocked.is_none());
     }
 
     #[test]
-    fn deserialize_blocked_string_yields_some_reason() {
-        let toml_str = r#"
-id = "1"
-title = "T"
-created = "2025-01-01T00:00:00Z"
-updated = "2025-01-01T00:00:00Z"
-blocked = "waiting on API"
-"#;
-        let card: Card = toml::from_str(toml_str).unwrap();
-        assert_eq!(card.blocked, Some("waiting on API".to_string()));
+    fn legacy_blocked_does_not_block() {
+        let mut board = blocker_board();
+        board.columns[0].cards[0].legacy_blocked = Some("waiting".into());
+        assert!(!board.is_blocked(&board.columns[0].cards[0]));
     }
 
     #[test]
-    fn deserialize_blocked_empty_string_yields_some_empty() {
-        let toml_str = r#"
-id = "1"
-title = "T"
-created = "2025-01-01T00:00:00Z"
-updated = "2025-01-01T00:00:00Z"
-blocked = ""
-"#;
-        let card: Card = toml::from_str(toml_str).unwrap();
-        assert_eq!(card.blocked, Some(String::new()));
+    fn blocked_by_loads_from_toml_array() {
+        let card: Card = toml::from_str(&card_toml("blocked_by = [\"2\", \"3\"]\n")).unwrap();
+        assert_eq!(card.blocked_by, vec!["2".to_string(), "3".to_string()]);
+    }
+
+    // ── blocker derivation ──
+
+    /// backlog: 1, 2, 3 · in-progress: 4 · done: 5 · archive: 6
+    fn blocker_board() -> Board {
+        let col = |slug: &str, order: u32, ids: &[&str]| Column {
+            slug: slug.into(),
+            name: slug.into(),
+            order,
+            wip_limit: None,
+            hidden: false,
+            cards: ids.iter().map(|id| Card::new((*id).into(), format!("Card {id}"))).collect(),
+        };
+        Board {
+            name: "Test".into(),
+            next_card_id: 7,
+            policies: Policies::default(),
+            sync_branch: None,
+            nerd_font: false,
+            created_at: None,
+            columns: vec![
+                col("backlog", 0, &["1", "2", "3"]),
+                col("in-progress", 1, &["4"]),
+                col("done", 2, &["5"]),
+                col("archive", 3, &["6"]),
+            ],
+        }
+    }
+
+    fn card_mut<'a>(board: &'a mut Board, id: &str) -> &'a mut Card {
+        let (c, k) = board.find_card(id).unwrap();
+        &mut board.columns[c].cards[k]
+    }
+
+    fn card<'a>(board: &'a Board, id: &str) -> &'a Card {
+        let (c, k) = board.find_card(id).unwrap();
+        &board.columns[c].cards[k]
     }
 
     #[test]
-    fn is_blocked_none_returns_false() {
-        let card = Card::new("1".into(), "T".into());
-        assert!(!card.is_blocked());
+    fn blocker_is_resolved_cases() {
+        let board = blocker_board();
+        assert!(!board.blocker_is_resolved("1"), "backlog is active");
+        assert!(!board.blocker_is_resolved("4"), "in-progress is active");
+        assert!(board.blocker_is_resolved("5"), "done resolves");
+        assert!(board.blocker_is_resolved("6"), "archive resolves");
+        assert!(board.blocker_is_resolved("99"), "missing card resolves");
     }
 
     #[test]
-    fn is_blocked_some_empty_returns_true() {
-        let mut card = Card::new("1".into(), "T".into());
-        card.blocked = Some(String::new());
-        assert!(card.is_blocked());
+    fn blocker_in_custom_auto_close_target_is_resolved() {
+        let mut board = blocker_board();
+        board.policies.auto_close_target = "in-progress".into();
+        assert!(board.blocker_is_resolved("4"));
     }
 
     #[test]
-    fn is_blocked_some_reason_returns_true() {
-        let mut card = Card::new("1".into(), "T".into());
-        card.blocked = Some("reason".into());
-        assert!(card.is_blocked());
+    fn active_blockers_and_is_blocked() {
+        let mut board = blocker_board();
+        card_mut(&mut board, "1").blocked_by = vec!["4".into(), "5".into(), "99".into()];
+        let c = card(&board, "1");
+        assert_eq!(board.active_blockers(c), vec!["4"]);
+        assert!(board.is_blocked(c));
+        assert!(!board.is_blocked(card(&board, "2")));
+    }
+
+    #[test]
+    fn only_resolved_blockers_means_not_blocked() {
+        let mut board = blocker_board();
+        card_mut(&mut board, "1").blocked_by = vec!["5".into(), "6".into()];
+        assert!(!board.is_blocked(card(&board, "1")));
+    }
+
+    #[test]
+    fn is_blocking_derives_multiple_dependents() {
+        let mut board = blocker_board();
+        card_mut(&mut board, "1").blocked_by = vec!["4".into()];
+        card_mut(&mut board, "2").blocked_by = vec!["3".into(), "4".into()];
+        assert_eq!(board.is_blocking("4"), vec!["1".to_string(), "2".to_string()]);
+        assert_eq!(board.is_blocking("3"), vec!["2".to_string()]);
+        assert!(board.is_blocking("1").is_empty());
+    }
+
+    #[test]
+    fn moving_blocker_to_done_and_back_toggles_blocked() {
+        let mut board = blocker_board();
+        card_mut(&mut board, "1").blocked_by = vec!["4".into()];
+        assert!(board.is_blocked(card(&board, "1")));
+
+        let (c, k) = board.find_card("4").unwrap();
+        board.move_card(c, k, 2); // → done
+        assert!(!board.is_blocked(card(&board, "1")));
+        assert_eq!(card(&board, "1").blocked_by, vec!["4".to_string()], "dependent untouched");
+
+        let (c, k) = board.find_card("4").unwrap();
+        board.move_card(c, k, 1); // back to in-progress
+        assert!(board.is_blocked(card(&board, "1")));
+    }
+
+    #[test]
+    fn deleting_blocker_unblocks() {
+        let mut board = blocker_board();
+        card_mut(&mut board, "1").blocked_by = vec!["4".into()];
+        board.columns[1].cards.clear();
+        assert!(!board.is_blocked(card(&board, "1")));
+    }
+
+    // ── validation and cycles ──
+
+    #[test]
+    fn validate_rejects_self_reference() {
+        let board = blocker_board();
+        assert_eq!(board.validate_blocked_by("1", &["1".into()]), Err("A card cannot block itself".into()));
+    }
+
+    #[test]
+    fn validate_rejects_unknown_id() {
+        let board = blocker_board();
+        assert_eq!(board.validate_blocked_by("1", &["99".into()]), Err("No card with ID 99".into()));
+    }
+
+    #[test]
+    fn validate_accepts_valid_ids() {
+        let board = blocker_board();
+        assert_eq!(board.validate_blocked_by("1", &["2".into(), "5".into()]), Ok(()));
+        assert_eq!(board.validate_blocked_by("1", &[]), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_direct_cycle() {
+        let mut board = blocker_board();
+        card_mut(&mut board, "2").blocked_by = vec!["3".into()];
+        assert_eq!(
+            board.validate_blocked_by("3", &["2".into()]),
+            Err("Cycle: 3 -> 2 -> 3".into())
+        );
+    }
+
+    #[test]
+    fn validate_rejects_transitive_cycle() {
+        let mut board = blocker_board();
+        card_mut(&mut board, "2").blocked_by = vec!["3".into()];
+        card_mut(&mut board, "3").blocked_by = vec!["4".into()];
+        assert_eq!(
+            board.validate_blocked_by("4", &["1".into(), "2".into()]),
+            Err("Cycle: 4 -> 2 -> 3 -> 4".into())
+        );
+    }
+
+    #[test]
+    fn diamond_is_not_a_cycle() {
+        let mut board = blocker_board();
+        card_mut(&mut board, "2").blocked_by = vec!["4".into()];
+        card_mut(&mut board, "3").blocked_by = vec!["4".into()];
+        assert_eq!(board.validate_blocked_by("1", &["2".into(), "3".into()]), Ok(()));
+    }
+
+    #[test]
+    fn cycle_on_disk_does_not_hang() {
+        let mut board = blocker_board();
+        card_mut(&mut board, "1").blocked_by = vec!["2".into()];
+        card_mut(&mut board, "2").blocked_by = vec!["1".into()];
+        // Both stay blocked; nothing loops.
+        assert!(board.is_blocked(card(&board, "1")));
+        assert!(board.is_blocked(card(&board, "2")));
+        assert_eq!(board.is_blocking("1"), vec!["2".to_string()]);
+        // A third card pointing into the cycle terminates and is not itself cyclic.
+        assert_eq!(board.validate_blocked_by("3", &["1".into()]), Ok(()));
+        // The cycle is reported once.
+        assert_eq!(board.blocker_cycles().len(), 1);
+    }
+
+    #[test]
+    fn blocker_cycles_empty_when_acyclic() {
+        let mut board = blocker_board();
+        card_mut(&mut board, "1").blocked_by = vec!["2".into()];
+        assert!(board.blocker_cycles().is_empty());
+    }
+
+    // ── parse_card_ids ──
+
+    #[test]
+    fn parse_card_ids_trims_dedupes_and_drops_empties() {
+        assert_eq!(parse_card_ids(" 1, #3 ,, 1,2 "), vec!["1", "3", "2"]);
+        assert!(parse_card_ids("").is_empty());
+        assert!(parse_card_ids(" , ").is_empty());
     }
 }

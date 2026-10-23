@@ -128,8 +128,14 @@ assert "edit add tag"        "$KANDO" edit 1 --tag-add critical
 assert "edit remove tag"     "$KANDO" edit 1 --tag-remove auth
 assert "edit add assignee"   "$KANDO" edit 1 --assignee-add bob
 assert "edit remove assignee" "$KANDO" edit 1 --assignee-remove alice
-assert "edit set blocked"    "$KANDO" edit 1 --blocked "waiting on review"
-assert "edit clear blocked"  "$KANDO" edit 1 --unblocked
+assert "edit set blocked-by" "$KANDO" edit 1 --blocked-by 2,3
+assert_output "list blocked marker" "\[blocked\]" "$KANDO" list
+assert_output "list --blocked-by" "Fix critical login bug" "$KANDO" list --blocked-by 2
+assert_output "json blocked_by" '"blocked_by"' "$KANDO" --json show 1
+assert "edit rejects cycle"  bash -c "! \"$KANDO\" edit 2 --blocked-by 1"
+assert "edit rejects self"   bash -c "! \"$KANDO\" edit 1 --blocked-by 1"
+assert "edit rejects unknown" bash -c "! \"$KANDO\" edit 1 --blocked-by 999"
+assert "edit clear blocked-by" "$KANDO" edit 1 --blocked-by ""
 assert "edit set due"        "$KANDO" edit 1 --due 2099-06-15
 assert "edit clear due"      "$KANDO" edit 1 --due clear
 

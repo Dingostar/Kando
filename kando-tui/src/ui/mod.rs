@@ -116,7 +116,7 @@ pub fn render(f: &mut Frame, board: &Board, state: &mut AppState, now: DateTime<
                 if let Some(card) = column.cards.get(card_idx) {
                     let mut view = card_detail::DetailView {
                         card,
-                        policies: &board.policies,
+                        board,
                         now,
                         icons: theme::icons(nerd_font),
                         image: card_image::ImagePane {

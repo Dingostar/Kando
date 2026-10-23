@@ -532,7 +532,13 @@ fn serialize_card(card: &Card) -> String {
         let assignees: Vec<String> = card.assignees.iter().map(|a| format!("{a:?}")).collect();
         fm.push_str(&format!("assignees = [{}]\n", assignees.join(", ")));
     }
-    if let Some(reason) = &card.blocked {
+    if !card.blocked_by.is_empty() {
+        let ids: Vec<String> = card.blocked_by.iter().map(|i| format!("{i:?}")).collect();
+        fm.push_str(&format!("blocked_by = [{}]\n", ids.join(", ")));
+    }
+    // Written back verbatim so a legacy note survives saves until it is
+    // replaced (see `Card::legacy_blocked`).
+    if let Some(reason) = &card.legacy_blocked {
         fm.push_str(&format!("blocked = {:?}\n", reason));
     }
     if let Some(due) = card.due {
@@ -972,9 +978,6 @@ pub fn serialize_template(tmpl: &Template) -> String {
     } else {
         fm.push_str("assignees = []\n");
     }
-    if let Some(reason) = &tmpl.blocked {
-        fm.push_str(&format!("blocked = {:?}\n", reason));
-    }
     if let Some(offset) = tmpl.due_offset_days {
         fm.push_str(&format!("due_offset_days = {offset}\n"));
     }
@@ -1147,6 +1150,60 @@ mod tests {
         let reloaded = load_board(&kando_dir).unwrap();
         let got: Vec<String> = reloaded.columns[0].cards.iter().map(|c| c.id.clone()).collect();
         assert_eq!(got, reversed);
+    }
+
+    #[test]
+    fn finishing_a_blocker_never_rewrites_its_dependents() {
+        let dir = tempfile::tempdir().unwrap();
+        let kando_dir = init_board_at(&dir.path().join(".kando"), "Test", None).unwrap();
+
+        let mut board = load_board(&kando_dir).unwrap();
+        let blocker = Card::new(board.next_card_id(), "Blocker".into());
+        let mut dependent = Card::new(board.next_card_id(), "Dependent".into());
+        dependent.blocked_by = vec![blocker.id.clone()];
+        let dep_id = dependent.id.clone();
+        board.columns[1].cards.push(blocker); // in-progress
+        board.columns[0].cards.push(dependent); // backlog
+        save_board(&kando_dir, &board).unwrap();
+
+        let dep_path = kando_dir.join("columns/backlog").join(format!("{dep_id}.md"));
+        let before = fs::read_to_string(&dep_path).unwrap();
+        let mtime_before = fs::metadata(&dep_path).unwrap().modified().unwrap();
+
+        let mut board = load_board(&kando_dir).unwrap();
+        assert!(board.is_blocked(&board.columns[0].cards[0]));
+        board.move_card(1, 0, 2); // blocker → done
+        save_board(&kando_dir, &board).unwrap();
+
+        let board = load_board(&kando_dir).unwrap();
+        assert!(!board.is_blocked(&board.columns[0].cards[0]), "dependent unblocked");
+        assert_eq!(fs::read_to_string(&dep_path).unwrap(), before, "dependent file untouched");
+        assert_eq!(fs::metadata(&dep_path).unwrap().modified().unwrap(), mtime_before);
+
+        // Pulling the blocker back out of Done re-blocks the dependent.
+        let mut board = board;
+        board.move_card(2, 0, 1);
+        save_board(&kando_dir, &board).unwrap();
+        let board = load_board(&kando_dir).unwrap();
+        assert!(board.is_blocked(&board.columns[0].cards[0]));
+    }
+
+    #[test]
+    fn legacy_blocked_card_loads_and_survives_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let kando_dir = init_board_at(&dir.path().join(".kando"), "Test", None).unwrap();
+        let path = kando_dir.join("columns/backlog/2.md");
+        fs::write(
+            &path,
+            "---\nid = \"2\"\ntitle = \"Old\"\ncreated = \"2025-01-01T00:00:00Z\"\nupdated = \"2025-01-01T00:00:00Z\"\npriority = \"normal\"\ntags = []\nblocked = \"waiting for 1\"\n---\n",
+        )
+        .unwrap();
+        let board = load_board(&kando_dir).unwrap();
+        let card = &board.columns[0].cards[0];
+        assert_eq!(card.legacy_blocked.as_deref(), Some("waiting for 1"));
+        assert!(!board.is_blocked(card));
+        save_board(&kando_dir, &board).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("blocked = \"waiting for 1\""));
     }
 
     #[test]
@@ -1685,33 +1742,33 @@ mod tests {
     // ── serialize_card edge cases ──
 
     #[test]
-    fn serialize_card_blocked_roundtrip() {
+    fn serialize_card_blocked_by_roundtrip() {
         let mut card = Card::new("001".into(), "Blocked".into());
-        card.blocked = Some(String::new());
+        card.blocked_by = vec!["2".into(), "13".into()];
         let text = serialize_card(&card);
-        assert!(text.contains("blocked = "));
-        // Roundtrip
+        assert!(text.contains("blocked_by = [\"2\", \"13\"]\n"));
         let (fm, _body) = parse_frontmatter(&text).unwrap();
         let loaded: Card = toml::from_str(&fm).unwrap();
-        assert!(loaded.is_blocked());
+        assert_eq!(loaded.blocked_by, card.blocked_by);
     }
 
     #[test]
-    fn serialize_card_blocked_with_reason_roundtrip() {
-        let mut card = Card::new("001".into(), "Blocked".into());
-        card.blocked = Some("waiting on API".into());
-        let text = serialize_card(&card);
-        assert!(text.contains("blocked = \"waiting on API\""));
-        let (fm, _body) = parse_frontmatter(&text).unwrap();
-        let loaded: Card = toml::from_str(&fm).unwrap();
-        assert_eq!(loaded.blocked, Some("waiting on API".to_string()));
-    }
-
-    #[test]
-    fn serialize_card_blocked_none_omits_field() {
+    fn serialize_card_empty_blocked_by_omits_field() {
         let card = Card::new("001".into(), "Normal card".into());
         let text = serialize_card(&card);
+        assert!(!text.contains("blocked_by"));
         assert!(!text.contains("blocked ="));
+    }
+
+    #[test]
+    fn serialize_card_preserves_legacy_blocked() {
+        let content = "---\nid = \"2\"\ntitle = \"Old\"\ncreated = \"2025-01-01T00:00:00Z\"\nupdated = \"2025-01-01T00:00:00Z\"\nblocked = \"waiting for 1\"\n---\n";
+        let (fm, _) = parse_frontmatter(content).unwrap();
+        let loaded: Card = toml::from_str(&fm).unwrap();
+        assert_eq!(loaded.legacy_blocked.as_deref(), Some("waiting for 1"));
+        assert!(loaded.blocked_by.is_empty());
+        let text = serialize_card(&loaded);
+        assert!(text.contains("blocked = \"waiting for 1\"\n"), "legacy note survives a save");
     }
 
     #[test]
@@ -1764,7 +1821,7 @@ mod tests {
         card.priority = Priority::Urgent;
         card.tags = vec!["bug".into(), "critical".into()];
         card.assignees = vec!["alice".into()];
-        card.blocked = Some(String::new());
+        card.blocked_by = vec!["7".into()];
         card.started = Some(Utc.with_ymd_and_hms(2025, 5, 1, 0, 0, 0).unwrap());
         card.completed = Some(Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap());
         card.body = "Full description.\n\nMultiple paragraphs.".into();
@@ -1777,7 +1834,7 @@ mod tests {
         assert_eq!(loaded.priority, Priority::Urgent);
         assert_eq!(loaded.tags, vec!["bug", "critical"]);
         assert_eq!(loaded.assignees, vec!["alice"]);
-        assert!(loaded.is_blocked());
+        assert_eq!(loaded.blocked_by, vec!["7"]);
         assert!(loaded.started.is_some());
         assert!(loaded.completed.is_some());
         assert_eq!(body, card.body);
@@ -2390,7 +2447,6 @@ mod tests {
             priority: Priority::Normal,
             tags: Vec::new(),
             assignees: Vec::new(),
-            blocked: None,
             due_offset_days: None,
             body: String::new(),
         }
@@ -2402,7 +2458,6 @@ mod tests {
             priority: Priority::High,
             tags: vec!["bug".into(), "critical".into()],
             assignees: vec!["alice".into()],
-            blocked: Some(String::new()),
             due_offset_days: Some(7),
             body: "## Steps\n\n1. Do X\n2. Do Y".to_string(),
         };
@@ -2414,7 +2469,6 @@ mod tests {
         assert_eq!(loaded.priority, Priority::High);
         assert_eq!(loaded.tags, vec!["bug", "critical"]);
         assert_eq!(loaded.assignees, vec!["alice"]);
-        assert!(loaded.blocked.is_some());
         assert_eq!(loaded.due_offset_days, Some(7));
         assert_eq!(loaded.body, "## Steps\n\n1. Do X\n2. Do Y");
     }
@@ -2430,28 +2484,17 @@ mod tests {
         assert_eq!(loaded.priority, Priority::Normal);
         assert!(loaded.tags.is_empty());
         assert!(loaded.assignees.is_empty());
-        assert!(loaded.blocked.is_none());
         assert!(loaded.due_offset_days.is_none());
         assert!(loaded.body.is_empty());
     }
 
     #[test]
-    fn template_blocked_with_reason_roundtrip() {
-        let tmpl = Template {
-            priority: Priority::Normal,
-            tags: Vec::new(),
-            assignees: Vec::new(),
-            blocked: Some("needs design review".into()),
-            due_offset_days: None,
-            body: String::new(),
-        };
-        let text = serialize_template(&tmpl);
-        assert!(text.contains("blocked = \"needs design review\""));
+    fn template_with_legacy_blocked_still_loads() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.md");
-        fs::write(&path, &text).unwrap();
+        fs::write(&path, "---\npriority = \"normal\"\nblocked = \"needs design review\"\n---\n").unwrap();
         let loaded = load_template(&path).unwrap();
-        assert_eq!(loaded.blocked, Some("needs design review".to_string()));
+        assert!(!serialize_template(&loaded).contains("blocked"));
     }
 
     #[test]
@@ -2483,7 +2526,6 @@ mod tests {
             priority: Priority::Low,
             tags: vec!["feat".into()],
             assignees: vec!["bob".into()],
-            blocked: None,
             due_offset_days: Some(14),
             body: "Description here".to_string(),
         };
@@ -2645,7 +2687,6 @@ mod tests {
         assert_eq!(loaded.priority, Priority::Normal);
         assert!(loaded.tags.is_empty());
         assert!(loaded.assignees.is_empty());
-        assert!(loaded.blocked.is_none());
         assert!(loaded.due_offset_days.is_none());
         assert!(loaded.body.is_empty());
     }
@@ -2747,7 +2788,6 @@ mod tests {
         tmpl.priority = Priority::High;
         tmpl.tags = vec!["rust".into(), "tui".into()];
         tmpl.assignees = vec!["alice".into()];
-        tmpl.blocked = Some(String::new());
         tmpl.body = "Template body content".into();
         tmpl.due_offset_days = Some(7);
         save_template(&kando_dir, "bug", &tmpl).unwrap();
@@ -2756,7 +2796,6 @@ mod tests {
         assert_eq!(loaded.priority, Priority::High);
         assert_eq!(loaded.tags, vec!["rust", "tui"]);
         assert_eq!(loaded.assignees, vec!["alice"]);
-        assert!(loaded.blocked.is_some());
         assert_eq!(loaded.body, "Template body content");
         assert_eq!(loaded.due_offset_days, Some(7));
     }

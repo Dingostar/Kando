@@ -10,7 +10,7 @@ use color_eyre::eyre::{bail, WrapErr};
 use clap::{Parser, Subcommand};
 
 use kando_core::board::storage::{append_activity, init_board, init_board_at, load_board, resolve_board, save_board, trash_card, remove_column_dir, rename_column_dir, BoardContext, BoardMode};
-use kando_core::board::{Card, Priority, generate_slug, normalize_column_orders, slug_for_rename, slug_to_name};
+use kando_core::board::{Board, Card, Priority, generate_slug, normalize_column_orders, slug_for_rename, slug_to_name};
 
 #[derive(Parser)]
 #[command(name = "kando", about = "A keyboard-first Kanban TUI", version)]
@@ -72,6 +72,9 @@ enum Command {
         /// Show only overdue cards
         #[arg(long)]
         overdue: bool,
+        /// Show only cards blocked by this card ID
+        #[arg(long)]
+        blocked_by: Option<String>,
         /// Output in CSV format for piping to other tools
         #[arg(long, conflicts_with = "json")]
         csv: bool,
@@ -103,12 +106,10 @@ enum Command {
         /// Remove assignees (comma-separated)
         #[arg(long, value_delimiter = ',')]
         assignee_remove: Vec<String>,
-        /// Mark as blocked, optionally with a reason
-        #[arg(long, conflicts_with = "unblocked", num_args = 0..=1, default_missing_value = "")]
-        blocked: Option<String>,
-        /// Clear blocked status
+        /// Set the cards this card is blocked by (comma-separated IDs, e.g. 1,3).
+        /// Replaces the current list; an empty string unblocks.
         #[arg(long)]
-        unblocked: bool,
+        blocked_by: Option<String>,
         /// Due date (YYYY-MM-DD), or "clear" to remove
         #[arg(long)]
         due: Option<String>,
@@ -451,8 +452,12 @@ struct CardEntry {
     priority: Priority,
     tags: Vec<String>,
     assignees: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    blocked: Option<String>,
+    /// IDs this card is blocked by, resolved or not.
+    blocked_by: Vec<String>,
+    /// Whether any of `blocked_by` is still unresolved.
+    is_blocked: bool,
+    /// Derived: IDs of the cards that list this one in their `blocked_by`.
+    is_blocking: Vec<String>,
     created: String,
     updated: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -464,7 +469,7 @@ struct CardEntry {
 }
 
 impl CardEntry {
-    fn from_card(card: &Card, col_name: &str, col_slug: &str) -> Self {
+    fn from_card(board: &Board, card: &Card, col_name: &str, col_slug: &str) -> Self {
         Self {
             id: card.id.clone(),
             title: card.title.clone(),
@@ -473,7 +478,9 @@ impl CardEntry {
             priority: card.priority,
             tags: card.tags.clone(),
             assignees: card.assignees.clone(),
-            blocked: card.blocked.clone(),
+            blocked_by: card.blocked_by.clone(),
+            is_blocked: board.is_blocked(card),
+            is_blocking: board.is_blocking(&card.id),
             created: card.created.to_rfc3339(),
             updated: card.updated.to_rfc3339(),
             started: card.started.map(|d| d.to_rfc3339()),
@@ -584,7 +591,9 @@ fn main() {
             template,
             column,
         }) => cmd_add(&cwd, &title, tags, assignee, priority, due.as_deref(), template.as_deref(), column.as_deref(), json),
-        Some(Command::List { tag, column, overdue, csv }) => cmd_list(&cwd, tag.as_deref(), column.as_deref(), overdue, json, csv),
+        Some(Command::List { tag, column, overdue, blocked_by, csv }) => {
+            cmd_list(&cwd, tag.as_deref(), column.as_deref(), overdue, blocked_by.as_deref(), json, csv)
+        }
         Some(Command::Delete { card_id }) => cmd_delete(&cwd, &card_id, json),
         Some(Command::Edit {
             card_id,
@@ -594,8 +603,7 @@ fn main() {
             tag_remove,
             assignee_add,
             assignee_remove,
-            blocked,
-            unblocked,
+            blocked_by,
             due,
         }) => cmd_edit(
             &cwd,
@@ -606,8 +614,7 @@ fn main() {
             tag_remove,
             assignee_add,
             assignee_remove,
-            blocked,
-            unblocked,
+            blocked_by.as_deref(),
             due.as_deref(),
             json,
         ),
@@ -870,7 +877,6 @@ fn cmd_add(
             card.priority = tmpl.priority;
             card.tags = tmpl.tags.clone();
             card.assignees = tmpl.assignees.clone();
-            card.blocked = tmpl.blocked.clone();
             if let Some(offset) = tmpl.due_offset_days {
                 let today = chrono::Utc::now().date_naive();
                 card.due = today.checked_add_days(chrono::Days::new(offset as u64));
@@ -946,7 +952,15 @@ fn cmd_add(
     Ok(())
 }
 
-fn cmd_list(cwd: &Path, tag: Option<&str>, column: Option<&str>, overdue: bool, json: bool, csv: bool) -> color_eyre::Result<()> {
+fn cmd_list(
+    cwd: &Path,
+    tag: Option<&str>,
+    column: Option<&str>,
+    overdue: bool,
+    blocked_by: Option<&str>,
+    json: bool,
+    csv: bool,
+) -> color_eyre::Result<()> {
     let (ctx, _sync) = resolve_and_sync(cwd)?;
     let kando_dir = &ctx.kando_dir;
     let board = load_board(kando_dir)?;
@@ -959,6 +973,7 @@ fn cmd_list(cwd: &Path, tag: Option<&str>, column: Option<&str>, overdue: bool, 
             let cards: Vec<&Card> = col.cards.iter()
                 .filter(|card| tag.is_none_or(|t| card.tags.iter().any(|ct| ct == t)))
                 .filter(|card| !overdue || card.is_overdue(today))
+                .filter(|card| blocked_by.is_none_or(|b| card.blocked_by.iter().any(|id| id == b)))
                 .collect();
             (col, cards)
         })
@@ -967,7 +982,7 @@ fn cmd_list(cwd: &Path, tag: Option<&str>, column: Option<&str>, overdue: bool, 
     if json {
         let entries: Vec<CardEntry> = filtered.iter()
             .flat_map(|(col, cards)| {
-                cards.iter().map(|card| CardEntry::from_card(card, &col.name, &col.slug))
+                cards.iter().map(|card| CardEntry::from_card(&board, card, &col.name, &col.slug))
             })
             .collect();
         return print_json(&entries);
@@ -984,14 +999,14 @@ fn cmd_list(cwd: &Path, tag: Option<&str>, column: Option<&str>, overdue: bool, 
                         card.priority.as_str().to_string(),
                         card.title.clone(), card.tags.join(";"),
                         card.assignees.join(";"),
-                        card.is_blocked().to_string(),
+                        card.blocked_by.join(";"),
                         card.due.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default(),
                     ]
                 })
             })
             .collect();
         return print_csv(
-            &["id", "column", "age", "priority", "title", "tags", "assignees", "blocked", "due"],
+            &["id", "column", "age", "priority", "title", "tags", "assignees", "blocked_by", "due"],
             &rows,
         );
     }
@@ -1026,7 +1041,7 @@ fn cmd_list(cwd: &Path, tag: Option<&str>, column: Option<&str>, overdue: bool, 
                 format!("[{}]", card.tags.join(", "))
             };
             let assignees = card.assignees.join(", ");
-            let blocked = if card.is_blocked() { " [blocked]" } else { "" };
+            let blocked = if board.is_blocked(card) { " [blocked]" } else { "" };
             let due = if card.is_overdue(now.date_naive()) {
                 format!(" [overdue {}]", card.due.unwrap().format("%Y-%m-%d"))
             } else if let Some(d) = card.due {
@@ -1277,8 +1292,7 @@ fn cmd_edit(
     tag_remove: Vec<String>,
     assignee_add: Vec<String>,
     assignee_remove: Vec<String>,
-    blocked: Option<String>,
-    unblocked: bool,
+    blocked_by: Option<&str>,
     due: Option<&str>,
     json: bool,
 ) -> color_eyre::Result<()> {
@@ -1292,13 +1306,17 @@ fn cmd_edit(
         || !tag_remove.is_empty()
         || !assignee_add.is_empty()
         || !assignee_remove.is_empty()
-        || blocked.is_some()
-        || unblocked
+        || blocked_by.is_some()
         || due.is_some();
 
     let (col_idx, card_idx) = board
         .find_card(card_id)
         .ok_or_else(|| color_eyre::eyre::eyre!("Card '{}' not found", card_id))?;
+
+    let blocked_by = blocked_by.map(kando_core::board::parse_card_ids);
+    if let Some(ids) = &blocked_by {
+        board.validate_blocked_by(card_id, ids).map_err(|e| color_eyre::eyre::eyre!(e))?;
+    }
 
     if has_flags {
         let card = &mut board.columns[col_idx].cards[card_idx];
@@ -1329,11 +1347,9 @@ fn cmd_edit(
             let assignee = assignee.trim().to_lowercase();
             card.assignees.retain(|a| a != &assignee);
         }
-        if let Some(reason) = blocked {
-            card.blocked = Some(reason);
-        }
-        if unblocked {
-            card.blocked = None;
+        if let Some(ids) = blocked_by {
+            card.blocked_by = ids;
+            card.legacy_blocked = None;
         }
         if let Some(due_str) = due {
             if due_str == "clear" {
@@ -1691,6 +1707,76 @@ fn cmd_sync_status(cwd: &Path, json: bool) -> color_eyre::Result<()> {
     Ok(())
 }
 
+/// Doctor checks for `blocked_by`: dangling IDs, cycles, and legacy free-text
+/// `blocked` fields left over from before blockers referenced cards.
+fn blocker_checks(board: &Board) -> Vec<DoctorCheck> {
+    let cards = || board.columns.iter().flat_map(|col| &col.cards);
+    let mut checks = Vec::new();
+
+    let dangling: Vec<String> = cards()
+        .flat_map(|card| {
+            card.blocked_by.iter()
+                .filter(|id| board.find_card(id).is_none())
+                .map(move |id| format!("{} -> {id}", card.id))
+        })
+        .collect();
+    checks.push(if dangling.is_empty() {
+        DoctorCheck {
+            name: "blocked_by_ids".into(),
+            passed: true,
+            message: "All blocker IDs refer to cards on the board".into(),
+            hint: None,
+        }
+    } else {
+        DoctorCheck {
+            name: "blocked_by_ids".into(),
+            passed: false,
+            message: format!("Blockers refer to missing cards: {}", dangling.join(", ")),
+            hint: Some("They no longer block anything; clear them with: kando edit <id> --blocked-by <ids>".into()),
+        }
+    });
+
+    let cycles = board.blocker_cycles();
+    checks.push(if cycles.is_empty() {
+        DoctorCheck {
+            name: "blocker_cycles".into(),
+            passed: true,
+            message: "No blocker cycles".into(),
+            hint: None,
+        }
+    } else {
+        let listed: Vec<String> = cycles.iter().map(|c| c.join(" -> ")).collect();
+        DoctorCheck {
+            name: "blocker_cycles".into(),
+            passed: false,
+            message: format!("Blocker cycles: {}", listed.join("; ")),
+            hint: Some("Break each cycle with: kando edit <id> --blocked-by <ids>".into()),
+        }
+    });
+
+    let legacy: Vec<&str> = cards()
+        .filter(|card| card.legacy_blocked.is_some())
+        .map(|card| card.id.as_str())
+        .collect();
+    checks.push(if legacy.is_empty() {
+        DoctorCheck {
+            name: "legacy_blocked".into(),
+            passed: true,
+            message: "No legacy free-text blockers".into(),
+            hint: None,
+        }
+    } else {
+        DoctorCheck {
+            name: "legacy_blocked".into(),
+            passed: false,
+            message: format!("Cards with a legacy `blocked` field: {}", legacy.join(", ")),
+            hint: Some("Re-block them with card IDs: kando edit <id> --blocked-by <ids>".into()),
+        }
+    });
+
+    checks
+}
+
 fn cmd_doctor(cwd: &Path, json: bool) -> color_eyre::Result<u32> {
     use kando_core::board::sync;
 
@@ -1799,7 +1885,23 @@ fn cmd_doctor(cwd: &Path, json: bool) -> color_eyre::Result<u32> {
     });
     if !json { println!("  \u{2713} {total_cards} cards loaded"); }
 
-    // 5. Git sync checks
+    // 5. Blockers. The TUI and `kando edit` enforce these, but hand edits and
+    //    git merges of two people's changes can still break them.
+    for check in blocker_checks(&board) {
+        if !json {
+            let mark = if check.passed { "\u{2713}" } else { "\u{2717}" };
+            println!("  {mark} {}", check.message);
+            if let Some(hint) = &check.hint {
+                println!("    \u{2192} {hint}");
+            }
+        }
+        if !check.passed {
+            errors += 1;
+        }
+        checks.push(check);
+    }
+
+    // 6. Git sync checks
     if let Some(ref branch) = board.sync_branch {
         if !json { println!("\nGit Sync (branch: {branch})"); }
 
@@ -2101,7 +2203,7 @@ fn cmd_show(cwd: &Path, card_id: &str, json: bool) -> color_eyre::Result<()> {
         let col = &board.columns[col_idx];
         let card = &col.cards[card_idx];
         let full = CardFull {
-            entry: CardEntry::from_card(card, &col.name, &col.slug),
+            entry: CardEntry::from_card(&board, card, &col.name, &col.slug),
             body: card.body.clone(),
         };
         return print_json(&full);
@@ -2153,7 +2255,7 @@ fn cmd_archive_list(cwd: &Path, json: bool, csv: bool) -> color_eyre::Result<()>
 
     if json {
         let entries: Vec<CardEntry> = archive_col.cards.iter()
-            .map(|card| CardEntry::from_card(card, &archive_col.name, &archive_col.slug))
+            .map(|card| CardEntry::from_card(&board, card, &archive_col.name, &archive_col.slug))
             .collect();
         return print_json(&entries);
     }
@@ -2229,7 +2331,7 @@ fn cmd_archive_search(cwd: &Path, query: &str, json: bool, csv: bool) -> color_e
 
     if json {
         let entries: Vec<CardEntry> = matches.iter()
-            .map(|card| CardEntry::from_card(card, &archive_col.name, &archive_col.slug))
+            .map(|card| CardEntry::from_card(&board, card, &archive_col.name, &archive_col.slug))
             .collect();
         return print_json(&entries);
     }
@@ -2820,9 +2922,19 @@ fn format_log_entry(entry: &serde_json::Value) -> String {
             extra_str(entry, "column")
         ),
         "blocker" => {
-            let blocked = extra_str(entry, "blocked");
-            let verb = if blocked == "true" { "Blocked" } else { "Unblocked" };
-            format!("{verb} \"{title}\" in {}", extra_str(entry, "column"))
+            let column = extra_str(entry, "column");
+            match entry.get("blocked_by").and_then(|v| v.as_str()) {
+                Some("") => format!("Unblocked \"{title}\" in {column}"),
+                Some(ids) => {
+                    let refs: Vec<String> = ids.split(',').map(|i| format!("#{i}")).collect();
+                    format!("Blocked \"{title}\" by {} in {column}", refs.join(", "))
+                }
+                // Entries written before blockers referenced cards.
+                None => {
+                    let verb = if extra_str(entry, "blocked") == "true" { "Blocked" } else { "Unblocked" };
+                    format!("{verb} \"{title}\" in {column}")
+                }
+            }
         }
         "archive" => format!(
             "Archived \"{title}\" from {} \u{2192} {}",
@@ -3092,8 +3204,6 @@ fn cmd_template_cli(cwd: &Path, action: Option<TemplateAction>, json: bool) -> c
                     tags: Vec<String>,
                     assignees: Vec<String>,
                     #[serde(skip_serializing_if = "Option::is_none")]
-                    blocked: Option<String>,
-                    #[serde(skip_serializing_if = "Option::is_none")]
                     due_offset_days: Option<u32>,
                 }
                 let entries: Vec<TemplateEntry> = templates.iter().map(|(slug, t)| TemplateEntry {
@@ -3102,7 +3212,6 @@ fn cmd_template_cli(cwd: &Path, action: Option<TemplateAction>, json: bool) -> c
                     priority: t.priority,
                     tags: t.tags.clone(),
                     assignees: t.assignees.clone(),
-                    blocked: t.blocked.clone(),
                     due_offset_days: t.due_offset_days,
                 }).collect();
                 return print_json(&entries);
@@ -3116,12 +3225,11 @@ fn cmd_template_cli(cwd: &Path, action: Option<TemplateAction>, json: bool) -> c
                         t.priority.as_str().to_string(),
                         t.tags.join(";"),
                         t.assignees.join(";"),
-                        t.blocked.is_some().to_string(),
                         t.due_offset_days.map(|d| d.to_string()).unwrap_or_default(),
                     ]
                 }).collect();
                 return print_csv(
-                    &["slug", "name", "priority", "tags", "assignees", "blocked", "due_offset_days"],
+                    &["slug", "name", "priority", "tags", "assignees", "due_offset_days"],
                     &rows,
                 );
             }
@@ -3146,7 +3254,6 @@ fn cmd_template_cli(cwd: &Path, action: Option<TemplateAction>, json: bool) -> c
                 priority: Priority::Normal,
                 tags: Vec::new(),
                 assignees: Vec::new(),
-                blocked: None,
                 due_offset_days: None,
                 body: String::new(),
             };
@@ -3816,6 +3923,50 @@ mod tests {
     }
 
     #[test]
+    fn format_log_entry_blocker_blocked_by_ids() {
+        let entry = serde_json::json!({"action": "blocker", "title": "Task", "blocked_by": "1,3", "column": "Backlog"});
+        assert_eq!(format_log_entry(&entry), "Blocked \"Task\" by #1, #3 in Backlog");
+    }
+
+    #[test]
+    fn format_log_entry_blocker_blocked_by_empty_is_unblock() {
+        let entry = serde_json::json!({"action": "blocker", "title": "Task", "blocked_by": "", "column": "Backlog"});
+        assert_eq!(format_log_entry(&entry), "Unblocked \"Task\" in Backlog");
+    }
+
+    #[test]
+    fn blocker_checks_flag_dangling_cycles_and_legacy() {
+        let mut board = empty_board();
+        let mut a = Card::new("1".into(), "A".into());
+        a.blocked_by = vec!["2".into(), "99".into()];
+        let mut b = Card::new("2".into(), "B".into());
+        b.blocked_by = vec!["1".into()];
+        let mut c = Card::new("3".into(), "C".into());
+        c.legacy_blocked = Some("waiting for 1".into());
+        board.columns.push(kando_core::Column {
+            slug: "backlog".into(),
+            name: "Backlog".into(),
+            order: 0,
+            wip_limit: None,
+            hidden: false,
+            cards: vec![a, b, c],
+        });
+        let checks = blocker_checks(&board);
+        let by_name = |n: &str| checks.iter().find(|c| c.name == n).unwrap();
+        assert!(!by_name("blocked_by_ids").passed);
+        assert!(by_name("blocked_by_ids").message.contains("1 -> 99"));
+        assert!(!by_name("blocker_cycles").passed);
+        assert!(by_name("blocker_cycles").message.contains("1 -> 2 -> 1"));
+        assert!(!by_name("legacy_blocked").passed);
+        assert!(by_name("legacy_blocked").message.contains('3'));
+    }
+
+    #[test]
+    fn blocker_checks_pass_on_clean_board() {
+        assert!(blocker_checks(&empty_board()).iter().all(|c| c.passed));
+    }
+
+    #[test]
     fn format_log_entry_blocker_unblocked() {
         let entry: serde_json::Value = serde_json::json!({"action": "blocker", "title": "Task", "blocked": "false", "column": "In Progress"});
         assert_eq!(format_log_entry(&entry), "Unblocked \"Task\" in In Progress");
@@ -4223,7 +4374,7 @@ mod tests {
     fn cmd_edit_title_change() {
         let dir = tempfile::tempdir().unwrap();
         let (kando_dir, id) = setup_board_with_card(dir.path());
-        cmd_edit(dir.path(), &id, Some("New Title"), None, vec![], vec![], vec![], vec![], None, false, None, false).unwrap();
+        cmd_edit(dir.path(), &id, Some("New Title"), None, vec![], vec![], vec![], vec![], None, None, false).unwrap();
         let board = load_board(&kando_dir).unwrap();
         let (ci, ki) = board.find_card(&id).unwrap();
         assert_eq!(board.columns[ci].cards[ki].title, "New Title");
@@ -4233,7 +4384,7 @@ mod tests {
     fn cmd_edit_priority_change() {
         let dir = tempfile::tempdir().unwrap();
         let (kando_dir, id) = setup_board_with_card(dir.path());
-        cmd_edit(dir.path(), &id, None, Some(Priority::High), vec![], vec![], vec![], vec![], None, false, None, false).unwrap();
+        cmd_edit(dir.path(), &id, None, Some(Priority::High), vec![], vec![], vec![], vec![], None, None, false).unwrap();
         let board = load_board(&kando_dir).unwrap();
         let (ci, ki) = board.find_card(&id).unwrap();
         assert_eq!(board.columns[ci].cards[ki].priority, Priority::High);
@@ -4243,7 +4394,7 @@ mod tests {
     fn cmd_edit_tag_add_normalizes_to_lowercase() {
         let dir = tempfile::tempdir().unwrap();
         let (kando_dir, id) = setup_board_with_card(dir.path());
-        cmd_edit(dir.path(), &id, None, None, vec!["URGENT".into()], vec![], vec![], vec![], None, false, None, false).unwrap();
+        cmd_edit(dir.path(), &id, None, None, vec!["URGENT".into()], vec![], vec![], vec![], None, None, false).unwrap();
         let board = load_board(&kando_dir).unwrap();
         let (ci, ki) = board.find_card(&id).unwrap();
         assert!(board.columns[ci].cards[ki].tags.contains(&"urgent".to_string()), "tag should be stored as lowercase");
@@ -4253,7 +4404,7 @@ mod tests {
     fn cmd_edit_tag_remove_normalizes_to_lowercase() {
         let dir = tempfile::tempdir().unwrap();
         let (kando_dir, id) = setup_board_with_card(dir.path()); // card has "bug" tag
-        cmd_edit(dir.path(), &id, None, None, vec![], vec!["BUG".into()], vec![], vec![], None, false, None, false).unwrap();
+        cmd_edit(dir.path(), &id, None, None, vec![], vec!["BUG".into()], vec![], vec![], None, None, false).unwrap();
         let board = load_board(&kando_dir).unwrap();
         let (ci, ki) = board.find_card(&id).unwrap();
         assert!(!board.columns[ci].cards[ki].tags.contains(&"bug".to_string()), "tag should be removed despite mixed case input");
@@ -4263,7 +4414,7 @@ mod tests {
     fn cmd_edit_add_existing_tag_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let (kando_dir, id) = setup_board_with_card(dir.path()); // card has "bug" tag
-        cmd_edit(dir.path(), &id, None, None, vec!["bug".into()], vec![], vec![], vec![], None, false, None, false).unwrap();
+        cmd_edit(dir.path(), &id, None, None, vec!["bug".into()], vec![], vec![], vec![], None, None, false).unwrap();
         let board = load_board(&kando_dir).unwrap();
         let (ci, ki) = board.find_card(&id).unwrap();
         let count = board.columns[ci].cards[ki].tags.iter().filter(|t| t.as_str() == "bug").count();
@@ -4274,7 +4425,7 @@ mod tests {
     fn cmd_edit_remove_nonexistent_tag_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let (kando_dir, id) = setup_board_with_card(dir.path());
-        let result = cmd_edit(dir.path(), &id, None, None, vec![], vec!["nonexistent".into()], vec![], vec![], None, false, None, false);
+        let result = cmd_edit(dir.path(), &id, None, None, vec![], vec!["nonexistent".into()], vec![], vec![], None, None, false);
         assert!(result.is_ok(), "removing a non-existent tag should not error");
         // Existing tags must not be disturbed
         let board = load_board(&kando_dir).unwrap();
@@ -4283,50 +4434,98 @@ mod tests {
             "existing tags should be unmodified after removing a non-existent tag");
     }
 
-    #[test]
-    fn cmd_edit_blocked_sets_flag() {
-        let dir = tempfile::tempdir().unwrap();
-        let (kando_dir, id) = setup_board_with_card(dir.path());
-        cmd_edit(dir.path(), &id, None, None, vec![], vec![], vec![], vec![], Some(String::new()), false, None, false).unwrap();
-        let board = load_board(&kando_dir).unwrap();
-        let (ci, ki) = board.find_card(&id).unwrap();
-        assert!(board.columns[ci].cards[ki].is_blocked(), "blocked flag should be set");
+    /// Board with cards "2" (from setup) plus "3" and "4", for blocker tests.
+    fn setup_board_for_blockers(parent: &Path) -> (PathBuf, String) {
+        use kando_core::board::storage::save_board;
+        let (kando_dir, id) = setup_board_with_card(parent);
+        let mut board = load_board(&kando_dir).unwrap();
+        for title in ["Other", "Third"] {
+            let new_id = board.next_card_id();
+            board.columns[0].cards.push(Card::new(new_id, title.into()));
+        }
+        save_board(&kando_dir, &board).unwrap();
+        (kando_dir, id)
+    }
+
+    fn blocked_by_of(kando_dir: &Path, id: &str) -> Vec<String> {
+        let board = load_board(kando_dir).unwrap();
+        let (ci, ki) = board.find_card(id).unwrap();
+        board.columns[ci].cards[ki].blocked_by.clone()
+    }
+
+    fn other_ids(kando_dir: &Path, id: &str) -> Vec<String> {
+        let board = load_board(kando_dir).unwrap();
+        let mut ids: Vec<String> = board.columns.iter().flat_map(|c| &c.cards)
+            .map(|c| c.id.clone()).filter(|c| c != id).collect();
+        ids.sort();
+        ids
     }
 
     #[test]
-    fn cmd_edit_unblocked_clears_flag() {
+    fn cmd_edit_blocked_by_sets_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let (kando_dir, id) = setup_board_for_blockers(dir.path());
+        let others = other_ids(&kando_dir, &id);
+        let arg = format!("{}, {}", others[0], others[1]);
+        cmd_edit(dir.path(), &id, None, None, vec![], vec![], vec![], vec![], Some(&arg), None, false).unwrap();
+        assert_eq!(blocked_by_of(&kando_dir, &id), others);
+        let board = load_board(&kando_dir).unwrap();
+        let (ci, ki) = board.find_card(&id).unwrap();
+        assert!(board.is_blocked(&board.columns[ci].cards[ki]));
+        assert_eq!(board.is_blocking(&others[0]), vec![id.clone()]);
+    }
+
+    #[test]
+    fn cmd_edit_blocked_by_empty_unblocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (kando_dir, id) = setup_board_for_blockers(dir.path());
+        let other = other_ids(&kando_dir, &id).remove(0);
+        cmd_edit(dir.path(), &id, None, None, vec![], vec![], vec![], vec![], Some(&other), None, false).unwrap();
+        cmd_edit(dir.path(), &id, None, None, vec![], vec![], vec![], vec![], Some(""), None, false).unwrap();
+        assert!(blocked_by_of(&kando_dir, &id).is_empty());
+    }
+
+    #[test]
+    fn cmd_edit_blocked_by_rejects_unknown_self_and_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (kando_dir, id) = setup_board_for_blockers(dir.path());
+        let other = other_ids(&kando_dir, &id).remove(0);
+        let edit = |card: &str, arg: &str| {
+            cmd_edit(dir.path(), card, None, None, vec![], vec![], vec![], vec![], Some(arg), None, false)
+        };
+
+        let err = edit(&id, "999").unwrap_err().to_string();
+        assert!(err.contains("No card with ID 999"), "{err}");
+        let err = edit(&id, &id).unwrap_err().to_string();
+        assert!(err.contains("cannot block itself"), "{err}");
+
+        edit(&id, &other).unwrap();
+        let err = edit(&other, &id).unwrap_err().to_string();
+        assert_eq!(err, format!("Cycle: {other} -> {id} -> {other}"));
+        assert!(blocked_by_of(&kando_dir, &other).is_empty(), "rejected edit leaves the card untouched");
+    }
+
+    #[test]
+    fn cmd_edit_blocked_by_clears_legacy_note() {
         use kando_core::board::storage::save_board;
         let dir = tempfile::tempdir().unwrap();
-        let (kando_dir, id) = setup_board_with_card(dir.path());
-        // Pre-set blocked = true
+        let (kando_dir, id) = setup_board_for_blockers(dir.path());
         let mut board = load_board(&kando_dir).unwrap();
         let (ci, ki) = board.find_card(&id).unwrap();
-        board.columns[ci].cards[ki].blocked = Some(String::new());
+        board.columns[ci].cards[ki].legacy_blocked = Some("waiting for 1".into());
         save_board(&kando_dir, &board).unwrap();
 
-        cmd_edit(dir.path(), &id, None, None, vec![], vec![], vec![], vec![], None, true, None, false).unwrap();
+        cmd_edit(dir.path(), &id, None, None, vec![], vec![], vec![], vec![], Some(""), None, false).unwrap();
         let board = load_board(&kando_dir).unwrap();
         let (ci, ki) = board.find_card(&id).unwrap();
-        assert!(!board.columns[ci].cards[ki].is_blocked(), "blocked flag should be cleared by --unblocked");
-    }
-
-    #[test]
-    fn cmd_edit_blocked_and_unblocked_both_true_unblocked_wins() {
-        // At the CLI level, clap's conflicts_with prevents this.
-        // At the function level, unblocked runs after blocked so it wins.
-        let dir = tempfile::tempdir().unwrap();
-        let (kando_dir, id) = setup_board_with_card(dir.path());
-        cmd_edit(dir.path(), &id, None, None, vec![], vec![], vec![], vec![], Some(String::new()), true, None, false).unwrap();
-        let board = load_board(&kando_dir).unwrap();
-        let (ci, ki) = board.find_card(&id).unwrap();
-        assert!(!board.columns[ci].cards[ki].is_blocked(), "when both blocked and unblocked are true, unblocked wins");
+        assert!(board.columns[ci].cards[ki].legacy_blocked.is_none());
     }
 
     #[test]
     fn cmd_edit_card_not_found_returns_err() {
         let dir = tempfile::tempdir().unwrap();
         setup_board_with_card(dir.path());
-        let result = cmd_edit(dir.path(), "nonexistent", Some("Title"), None, vec![], vec![], vec![], vec![], None, false, None, false);
+        let result = cmd_edit(dir.path(), "nonexistent", Some("Title"), None, vec![], vec![], vec![], vec![], None, None, false);
         assert!(result.is_err(), "editing a non-existent card should return Err");
     }
 
@@ -4365,7 +4564,7 @@ mod tests {
     fn cmd_edit_due_date_sets_field() {
         let dir = tempfile::tempdir().unwrap();
         let (kando_dir, id) = setup_board_with_card(dir.path());
-        cmd_edit(dir.path(), &id, None, None, vec![], vec![], vec![], vec![], None, false, Some("2025-08-15"), false).unwrap();
+        cmd_edit(dir.path(), &id, None, None, vec![], vec![], vec![], vec![], None, Some("2025-08-15"), false).unwrap();
         let board = load_board(&kando_dir).unwrap();
         let (ci, ki) = board.find_card(&id).unwrap();
         assert_eq!(board.columns[ci].cards[ki].due, Some(chrono::NaiveDate::from_ymd_opt(2025, 8, 15).unwrap()));
@@ -4376,13 +4575,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (kando_dir, id) = setup_board_with_card(dir.path());
         // Set a due date first
-        cmd_edit(dir.path(), &id, None, None, vec![], vec![], vec![], vec![], None, false, Some("2025-08-15"), false).unwrap();
+        cmd_edit(dir.path(), &id, None, None, vec![], vec![], vec![], vec![], None, Some("2025-08-15"), false).unwrap();
         // Verify it was actually set
         let board = load_board(&kando_dir).unwrap();
         let (ci, ki) = board.find_card(&id).unwrap();
         assert!(board.columns[ci].cards[ki].due.is_some(), "precondition: due date should be set before clearing");
         // Clear it
-        cmd_edit(dir.path(), &id, None, None, vec![], vec![], vec![], vec![], None, false, Some("clear"), false).unwrap();
+        cmd_edit(dir.path(), &id, None, None, vec![], vec![], vec![], vec![], None, Some("clear"), false).unwrap();
         let board = load_board(&kando_dir).unwrap();
         let (ci, ki) = board.find_card(&id).unwrap();
         assert!(board.columns[ci].cards[ki].due.is_none());
@@ -4392,7 +4591,7 @@ mod tests {
     fn cmd_edit_due_date_invalid_returns_error() {
         let dir = tempfile::tempdir().unwrap();
         let (_, id) = setup_board_with_card(dir.path());
-        let result = cmd_edit(dir.path(), &id, None, None, vec![], vec![], vec![], vec![], None, false, Some("bad"), false);
+        let result = cmd_edit(dir.path(), &id, None, None, vec![], vec![], vec![], vec![], None, Some("bad"), false);
         assert!(result.is_err());
     }
 
@@ -4401,7 +4600,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (kando_dir, id) = setup_board_with_card(dir.path());
         // Only --due, no other flags; should still trigger mutation without opening editor
-        cmd_edit(dir.path(), &id, None, None, vec![], vec![], vec![], vec![], None, false, Some("2025-01-01"), false).unwrap();
+        cmd_edit(dir.path(), &id, None, None, vec![], vec![], vec![], vec![], None, Some("2025-01-01"), false).unwrap();
         let board = load_board(&kando_dir).unwrap();
         let (ci, ki) = board.find_card(&id).unwrap();
         assert_eq!(board.columns[ci].cards[ki].due, Some(chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap()));
@@ -5407,15 +5606,47 @@ mod tests {
 
     // ── JSON output tests ──
 
+    fn empty_board() -> Board {
+        Board {
+            name: "Test".into(),
+            next_card_id: 1,
+            policies: kando_core::Policies::default(),
+            sync_branch: None,
+            nerd_font: false,
+            created_at: None,
+            columns: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn card_entry_derives_blocked_and_blocking_from_board() {
+        let mut board = empty_board();
+        let mut dependent = Card::new("1".into(), "Dependent".into());
+        dependent.blocked_by = vec!["2".into()];
+        board.columns.push(kando_core::Column {
+            slug: "backlog".into(),
+            name: "Backlog".into(),
+            order: 0,
+            wip_limit: None,
+            hidden: false,
+            cards: vec![dependent.clone(), Card::new("2".into(), "Blocker".into())],
+        });
+        let dep = CardEntry::from_card(&board, &board.columns[0].cards[0], "Backlog", "backlog");
+        assert!(dep.is_blocked);
+        let blocker = CardEntry::from_card(&board, &board.columns[0].cards[1], "Backlog", "backlog");
+        assert_eq!(blocker.is_blocking, vec!["1"]);
+        assert!(!blocker.is_blocked);
+    }
+
     #[test]
     fn card_entry_from_card_maps_all_fields() {
         let mut card = Card::new("42".into(), "Test task".into());
         card.tags = vec!["bug".into(), "auth".into()];
         card.assignees = vec!["alice".into()];
         card.priority = Priority::High;
-        card.blocked = Some(String::new());
+        card.blocked_by = vec!["7".into()];
 
-        let entry = CardEntry::from_card(&card, "In Progress", "in-progress");
+        let entry = CardEntry::from_card(&empty_board(), &card, "In Progress", "in-progress");
 
         assert_eq!(entry.id, "42");
         assert_eq!(entry.title, "Test task");
@@ -5424,7 +5655,8 @@ mod tests {
         assert_eq!(entry.priority, Priority::High);
         assert_eq!(entry.tags, vec!["bug", "auth"]);
         assert_eq!(entry.assignees, vec!["alice"]);
-        assert!(entry.blocked.is_some());
+        assert_eq!(entry.blocked_by, vec!["7"]);
+        assert!(!entry.is_blocked, "card 7 is not on the board, so it no longer blocks");
         assert!(!entry.created.is_empty());
         assert!(!entry.updated.is_empty());
         // Verify created/updated are valid RFC 3339
@@ -5442,7 +5674,7 @@ mod tests {
         card.started = Some(now);
         card.completed = Some(now);
 
-        let entry = CardEntry::from_card(&card, "Done", "done");
+        let entry = CardEntry::from_card(&empty_board(), &card, "Done", "done");
 
         assert!(entry.started.is_some());
         assert!(entry.completed.is_some());
@@ -5453,7 +5685,7 @@ mod tests {
     #[test]
     fn card_entry_serializes_to_valid_json() {
         let card = Card::new("1".into(), "JSON card".into());
-        let entry = CardEntry::from_card(&card, "Backlog", "backlog");
+        let entry = CardEntry::from_card(&empty_board(), &card, "Backlog", "backlog");
         let value = serde_json::to_value(&entry).unwrap();
 
         assert!(value.is_object());
@@ -5462,7 +5694,10 @@ mod tests {
         assert_eq!(obj["title"], "JSON card");
         assert_eq!(obj["column"], "Backlog");
         assert_eq!(obj["column_slug"], "backlog");
-        assert!(!obj.contains_key("blocked"), "blocked should be absent when None (skip_serializing_if)");
+        assert!(!obj.contains_key("blocked"), "the legacy `blocked` key is gone");
+        assert_eq!(obj["blocked_by"], serde_json::json!([]));
+        assert_eq!(obj["is_blocked"], false);
+        assert_eq!(obj["is_blocking"], serde_json::json!([]));
         // Always-present datetime fields
         assert!(obj.contains_key("created"));
         assert!(obj.contains_key("updated"));
@@ -5474,7 +5709,7 @@ mod tests {
     #[test]
     fn card_entry_empty_collections_serialize_as_empty_arrays() {
         let card = Card::new("1".into(), "No tags".into());
-        let entry = CardEntry::from_card(&card, "Backlog", "backlog");
+        let entry = CardEntry::from_card(&empty_board(), &card, "Backlog", "backlog");
         let value = serde_json::to_value(&entry).unwrap();
         let obj = value.as_object().unwrap();
         assert_eq!(obj["tags"], serde_json::json!([]));
@@ -5484,7 +5719,7 @@ mod tests {
     #[test]
     fn card_full_empty_body_serializes_as_empty_string() {
         let card = Card::new("1".into(), "Empty body".into());
-        let entry = CardEntry::from_card(&card, "Backlog", "backlog");
+        let entry = CardEntry::from_card(&empty_board(), &card, "Backlog", "backlog");
         let full = CardFull { entry, body: String::new() };
         let value = serde_json::to_value(&full).unwrap();
         let obj = value.as_object().unwrap();
@@ -5495,7 +5730,7 @@ mod tests {
     fn card_entry_due_date_present_serializes() {
         let mut card = Card::new("1".into(), "Due card".into());
         card.due = Some(chrono::NaiveDate::from_ymd_opt(2025, 7, 4).unwrap());
-        let entry = CardEntry::from_card(&card, "Backlog", "backlog");
+        let entry = CardEntry::from_card(&empty_board(), &card, "Backlog", "backlog");
         let value = serde_json::to_value(&entry).unwrap();
         assert_eq!(value["due"], "2025-07-04");
     }
@@ -5503,7 +5738,7 @@ mod tests {
     #[test]
     fn card_entry_due_date_none_omitted_from_json() {
         let card = Card::new("1".into(), "No due".into());
-        let entry = CardEntry::from_card(&card, "Backlog", "backlog");
+        let entry = CardEntry::from_card(&empty_board(), &card, "Backlog", "backlog");
         let value = serde_json::to_value(&entry).unwrap();
         assert!(value.get("due").is_none(), "due should be omitted when None");
     }
@@ -5511,7 +5746,7 @@ mod tests {
     #[test]
     fn card_full_serializes_with_body_and_flattened_entry() {
         let card = Card::new("5".into(), "Full card".into());
-        let entry = CardEntry::from_card(&card, "Backlog", "backlog");
+        let entry = CardEntry::from_card(&empty_board(), &card, "Backlog", "backlog");
         let full = CardFull {
             entry,
             body: "Some description\n\n- item 1\n- item 2".into(),
@@ -5676,28 +5911,28 @@ mod tests {
     fn cmd_list_json_returns_ok() {
         let dir = tempfile::tempdir().unwrap();
         kando_core::board::storage::init_board(dir.path(), "Test", None).unwrap();
-        assert!(cmd_list(dir.path(), None, None, false, true, false).is_ok());
+        assert!(cmd_list(dir.path(), None, None, false, None, true, false).is_ok());
     }
 
     #[test]
     fn cmd_list_json_with_card_returns_ok() {
         let dir = tempfile::tempdir().unwrap();
         setup_board_with_card(dir.path());
-        assert!(cmd_list(dir.path(), None, None, false, true, false).is_ok());
+        assert!(cmd_list(dir.path(), None, None, false, None, true, false).is_ok());
     }
 
     #[test]
     fn cmd_list_json_tag_filter_returns_ok() {
         let dir = tempfile::tempdir().unwrap();
         setup_board_with_card(dir.path());
-        assert!(cmd_list(dir.path(), Some("bug"), None, false, true, false).is_ok());
+        assert!(cmd_list(dir.path(), Some("bug"), None, false, None, true, false).is_ok());
     }
 
     #[test]
     fn cmd_list_json_column_filter_returns_ok() {
         let dir = tempfile::tempdir().unwrap();
         setup_board_with_card(dir.path());
-        assert!(cmd_list(dir.path(), None, Some("backlog"), false, true, false).is_ok());
+        assert!(cmd_list(dir.path(), None, Some("backlog"), false, None, true, false).is_ok());
     }
 
     #[test]
@@ -5710,7 +5945,7 @@ mod tests {
         cmd_add(dir.path(), "Future task", vec![], vec![], Some(Priority::Normal), Some("2099-12-31"), None, None, false).unwrap();
         cmd_add(dir.path(), "No due task", vec![], vec![], Some(Priority::Normal), None, None, None, false).unwrap();
         // With --overdue, only the overdue card should appear
-        assert!(cmd_list(dir.path(), None, None, true, false, false).is_ok());
+        assert!(cmd_list(dir.path(), None, None, true, None, false, false).is_ok());
         let board = load_board(&kando_dir).unwrap();
         let today = chrono::Utc::now().date_naive();
         let overdue_count = board.columns[0].cards.iter().filter(|c| c.is_overdue(today)).count();
@@ -5762,14 +5997,14 @@ mod tests {
     fn cmd_edit_json_title_returns_ok() {
         let dir = tempfile::tempdir().unwrap();
         let (_, id) = setup_board_with_card(dir.path());
-        assert!(cmd_edit(dir.path(), &id, Some("New Title"), None, vec![], vec![], vec![], vec![], None, false, None, true).is_ok());
+        assert!(cmd_edit(dir.path(), &id, Some("New Title"), None, vec![], vec![], vec![], vec![], None, None, true).is_ok());
     }
 
     #[test]
     fn cmd_edit_json_title_actually_changed() {
         let dir = tempfile::tempdir().unwrap();
         let (kando_dir, id) = setup_board_with_card(dir.path());
-        cmd_edit(dir.path(), &id, Some("New Title"), None, vec![], vec![], vec![], vec![], None, false, None, true).unwrap();
+        cmd_edit(dir.path(), &id, Some("New Title"), None, vec![], vec![], vec![], vec![], None, None, true).unwrap();
         let board = load_board(&kando_dir).unwrap();
         let (ci, ki) = board.find_card(&id).unwrap();
         assert_eq!(board.columns[ci].cards[ki].title, "New Title");
@@ -5779,7 +6014,7 @@ mod tests {
     fn cmd_edit_json_no_flags_bails() {
         let dir = tempfile::tempdir().unwrap();
         let (_, id) = setup_board_with_card(dir.path());
-        let result = cmd_edit(dir.path(), &id, None, None, vec![], vec![], vec![], vec![], None, false, None, true);
+        let result = cmd_edit(dir.path(), &id, None, None, vec![], vec![], vec![], vec![], None, None, true);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("--json requires at least one edit flag"), "got: {err_msg}");
@@ -5789,21 +6024,21 @@ mod tests {
     fn cmd_edit_json_priority_returns_ok() {
         let dir = tempfile::tempdir().unwrap();
         let (_, id) = setup_board_with_card(dir.path());
-        assert!(cmd_edit(dir.path(), &id, None, Some(Priority::Urgent), vec![], vec![], vec![], vec![], None, false, None, true).is_ok());
+        assert!(cmd_edit(dir.path(), &id, None, Some(Priority::Urgent), vec![], vec![], vec![], vec![], None, None, true).is_ok());
     }
 
     #[test]
     fn cmd_edit_json_tag_add_returns_ok() {
         let dir = tempfile::tempdir().unwrap();
         let (_, id) = setup_board_with_card(dir.path());
-        assert!(cmd_edit(dir.path(), &id, None, None, vec!["feature".into()], vec![], vec![], vec![], None, false, None, true).is_ok());
+        assert!(cmd_edit(dir.path(), &id, None, None, vec!["feature".into()], vec![], vec![], vec![], None, None, true).is_ok());
     }
 
     #[test]
-    fn cmd_edit_json_blocked_returns_ok() {
+    fn cmd_edit_json_blocked_by_returns_ok() {
         let dir = tempfile::tempdir().unwrap();
         let (_, id) = setup_board_with_card(dir.path());
-        assert!(cmd_edit(dir.path(), &id, None, None, vec![], vec![], vec![], vec![], Some(String::new()), false, None, true).is_ok());
+        assert!(cmd_edit(dir.path(), &id, None, None, vec![], vec![], vec![], vec![], Some(""), None, true).is_ok());
     }
 
     #[test]
@@ -6031,7 +6266,7 @@ mod tests {
     fn cmd_list_csv_returns_ok() {
         let dir = tempfile::tempdir().unwrap();
         setup_board_with_card(dir.path());
-        assert!(cmd_list(dir.path(), None, None, false, false, true).is_ok());
+        assert!(cmd_list(dir.path(), None, None, false, None, false, true).is_ok());
     }
 
     #[test]
@@ -6109,7 +6344,7 @@ mod tests {
     fn cmd_list_csv_empty_board_returns_ok() {
         let dir = tempfile::tempdir().unwrap();
         kando_core::board::storage::init_board(dir.path(), "Test", None).unwrap();
-        assert!(cmd_list(dir.path(), None, None, false, false, true).is_ok());
+        assert!(cmd_list(dir.path(), None, None, false, None, false, true).is_ok());
     }
 
     #[test]
@@ -6170,7 +6405,6 @@ mod tests {
             priority: Priority::Normal,
             tags: Vec::new(),
             assignees: Vec::new(),
-            blocked: None,
             due_offset_days: None,
             body: String::new(),
         };
@@ -6250,7 +6484,6 @@ mod tests {
             priority: Priority::High,
             tags: vec!["bug".to_string()],
             assignees: vec!["alice".to_string()],
-            blocked: Some(String::new()),
             due_offset_days: Some(7),
             body: "## Steps\n\n## Expected\n".to_string(),
         };
@@ -6263,7 +6496,7 @@ mod tests {
         assert_eq!(card.priority, Priority::High);
         assert_eq!(card.tags, vec!["bug"]);
         assert_eq!(card.assignees, vec!["alice"]);
-        assert!(card.is_blocked());
+        assert!(card.blocked_by.is_empty());
         // due_offset_days=7 means today + 7 days
         let expected_due = chrono::Utc::now().date_naive()
             .checked_add_days(chrono::Days::new(7)).unwrap();
@@ -6284,7 +6517,6 @@ mod tests {
             priority: Priority::High,
             tags: vec!["bug".to_string()],
             assignees: Vec::new(),
-            blocked: None,
             due_offset_days: None,
             body: String::new(),
         };
@@ -6308,7 +6540,6 @@ mod tests {
             priority: Priority::Normal,
             tags: vec!["bug".to_string()],
             assignees: vec!["alice".to_string()],
-            blocked: None,
             due_offset_days: None,
             body: String::new(),
         };
@@ -6353,7 +6584,6 @@ mod tests {
             priority: Priority::Normal,
             tags: Vec::new(),
             assignees: Vec::new(),
-            blocked: None,
             due_offset_days: Some(7),
             body: String::new(),
         };

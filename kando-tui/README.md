@@ -46,7 +46,7 @@ Your board consists of **columns** (like Backlog, In Progress, Done) that contai
 | **Assignees** | Assign cards to team members by name |
 | **Priority** | Set priority level (low, normal, high, urgent). Cards auto-sort by priority |
 | **Due Dates** | Set a due date on a card. Overdue cards get a visual warning |
-| **Blockers** | Mark a card as blocked with an optional reason explaining what's preventing progress |
+| **Blockers** | Mark a card as blocked by other cards. It stays blocked until those are done or archived, and the detail view shows both what it waits on and what it is blocking |
 | **Age Tracking** | See how long a card has been sitting around |
 
 ### Navigating the Board
@@ -127,7 +127,7 @@ Press `.` to repeat the last mutation. The status bar shows what `.` will do (e.
 | Set tags | `tags: bug, ui` | Overwrites tags on selected card |
 | Set assignees | `assignees: alice` | Overwrites assignees on selected card |
 | Set due date | `due: 2026-03-15` | Sets or clears due date on selected card |
-| Toggle blocked | `block` / `unblock` | Sets or clears blocked status (with reason) |
+| Set blockers | `blocked by: 1, 3` / `unblock` | Overwrites the blocked-by list on selected card |
 | Archive | `archive` | Moves selected card to archive column |
 | Delete card | `delete` | Opens confirmation prompt before deleting |
 | Pipe command | `pipe: echo hi` | Re-runs stored command on selected card |
@@ -179,9 +179,9 @@ scripts can access structured card metadata without parsing frontmatter:
 | `KANDO_CARD_PRIORITY` | Priority level (`low`, `normal`, `high`, `urgent`) | `high` |
 | `KANDO_CARD_COLUMN` | Display name of the card's column | `In Progress` |
 | `KANDO_CARD_DUE` | Due date (`YYYY-MM-DD`) | `2026-04-01` |
-| `KANDO_CARD_BLOCKED` | Blocker reason | `waiting on API review` |
+| `KANDO_CARD_BLOCKED_BY` | Comma-separated IDs of the cards it is blocked by | `2,3` |
 
-Tags, assignees, column, due, and blocked values are empty strings when unset.
+Tags, assignees, column, due, and blocked-by values are empty strings when unset.
 
 ## Team Collaboration
 
@@ -287,7 +287,7 @@ kando col hide backlog
 ```
 
 ### Templates
-Templates reduce friction for recurring card types like bugs, features, or chores. They are stored as `.md` files with TOML frontmatter in `.kando/templates/` and can set priority, tags, assignees, blocked status, due date offset, and body content.
+Templates reduce friction for recurring card types like bugs, features, or chores. They are stored as `.md` files with TOML frontmatter in `.kando/templates/` and can set priority, tags, assignees, due date offset, and body content.
 
 ```sh
 kando template list              # list all templates
@@ -378,7 +378,7 @@ Now every time a card is created (TUI or CLI), your Mac reads the title aloud.
 | `KANDO_CARD_ID` | Card identifier |
 | `KANDO_CARD_TITLE` | Card title |
 | `KANDO_CARD_DUE` | Due date (`YYYY-MM-DD`, empty if unset) |
-| `KANDO_CARD_BLOCKED` | Blocker reason (empty if unset) |
+| `KANDO_CARD_BLOCKED_BY` | Comma-separated IDs of the cards it is blocked by (empty if none) |
 | `KANDO_BOARD_DIR` | Absolute path to the project root |
 | `KANDO_FROM`, `KANDO_TO`, etc. | Extra context depending on the event |
 
@@ -403,6 +403,8 @@ kando --json template list
 ```
 
 Mutation commands return result objects (e.g. `{"id", "title", "column"}`). Read commands return arrays or objects. `--json` is ignored by commands that don't produce data output (`init`, `sync`).
+
+Card objects carry `blocked_by` (the IDs the card waits on), `is_blocked` (whether any of them is still unresolved), and `is_blocking` (the IDs of the cards waiting on this one, derived on the fly). These replace the old `blocked` reason string, so scripts that read `blocked` need updating.
 
 ### CSV Output
 
@@ -442,7 +444,7 @@ assignees = ["alice"]
 priority = "high"
 created = "2024-01-15T10:30:00Z"
 updated = "2024-01-16T14:22:00Z"
-blocked = "waiting on API review"
+blocked_by = ["2", "3"]
 ---
 
 ## Notes
@@ -453,3 +455,7 @@ This is the card body. Use regular Markdown here.
 - Step 2: Fix it
 - Step 3: Write tests
 ```
+
+`blocked_by` lists the IDs of the cards this one waits on. Only that side is stored: what a card is blocking is worked out from the other cards each time the board loads. A blocker stops counting once it is in `done`, in `archive` (or the configured auto-close column), or gone from the board, and nothing else is rewritten when that happens. Edit the list with `Space b` in the TUI or `kando edit <id> --blocked-by 2,3` (an empty value unblocks). Self-references, unknown IDs and cycles are refused, and `kando doctor` reports any that get in through hand edits or merges.
+
+Boards from before `blocked_by` may have a free-text `blocked = "..."` field. It still loads and is kept on save, but no longer blocks anything; `kando doctor` lists those cards so you can re-block them with card IDs.

@@ -142,7 +142,7 @@ pub fn compute_metrics(board: &Board, since: Option<DateTime<Utc>>, kando_dir: O
         .enumerate()
         .filter(|(idx, col)| *idx > 0 && col.slug != "done")
         .flat_map(|(_, col)| col.cards.iter())
-        .filter(|card| card.is_blocked())
+        .filter(|card| board.is_blocked(card))
         .count() as u32;
 
     let blocked_pct = if active_wip_total > 0 {
@@ -1290,9 +1290,9 @@ mod tests {
     #[test]
     fn blocked_count_only_active_columns() {
         let mut blocked_in_backlog = Card::new("1".into(), "A".into());
-        blocked_in_backlog.blocked = Some(String::new());
+        blocked_in_backlog.blocked_by = vec!["3".into()];
         let mut blocked_in_progress = Card::new("2".into(), "B".into());
-        blocked_in_progress.blocked = Some(String::new());
+        blocked_in_progress.blocked_by = vec!["3".into()];
         let not_blocked = Card::new("3".into(), "C".into());
 
         let board = make_board(vec![
@@ -1308,7 +1308,7 @@ mod tests {
     #[test]
     fn blocked_pct_calculation() {
         let mut blocked = Card::new("1".into(), "A".into());
-        blocked.blocked = Some(String::new());
+        blocked.blocked_by = vec!["2".into()];
 
         let board = make_board(vec![
             make_column("backlog", "Backlog", vec![]),
@@ -1324,6 +1324,19 @@ mod tests {
         let metrics = compute_metrics(&board, None, None);
         assert_eq!(metrics.blocked_count, 1);
         assert!((metrics.blocked_pct - 20.0).abs() < 0.1, "expected 20%, got {}", metrics.blocked_pct);
+    }
+
+    #[test]
+    fn blocked_count_ignores_resolved_blockers() {
+        let mut dependent = Card::new("1".into(), "A".into());
+        dependent.blocked_by = vec!["2".into(), "99".into()];
+        let board = make_board(vec![
+            make_column("backlog", "Backlog", vec![]),
+            make_column("in-progress", "In Progress", vec![dependent]),
+            make_column("done", "Done", vec![Card::new("2".into(), "B".into())]),
+        ]);
+        let metrics = compute_metrics(&board, None, None);
+        assert_eq!(metrics.blocked_count, 0);
     }
 
     #[test]

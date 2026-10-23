@@ -83,9 +83,10 @@ pub fn hook_name_for_action(action: &str) -> String {
 // Hook execution
 // ---------------------------------------------------------------------------
 
-/// Best-effort read of a card's `due` and `blocked` fields from disk.
-/// Returns `(due, blocked)` as strings (empty if not found or not set).
-fn read_card_due_blocked(kando_dir: &Path, card_id: &str) -> (String, String) {
+/// Best-effort read of a card's `due` and `blocked_by` fields from disk.
+/// Returns `(due, blocked_by)` as strings (empty if not found or not set);
+/// `blocked_by` is the comma-separated ID list, e.g. `2,3`.
+fn read_card_due_blocked_by(kando_dir: &Path, card_id: &str) -> (String, String) {
     let columns_dir = kando_dir.join("columns");
     let entries = match std::fs::read_dir(&columns_dir) {
         Ok(e) => e,
@@ -98,11 +99,30 @@ fn read_card_due_blocked(kando_dir: &Path, card_id: &str) -> (String, String) {
         let card_path = entry.path().join(format!("{card_id}.md"));
         if let Ok(contents) = std::fs::read_to_string(&card_path) {
             let due = extract_frontmatter_value(&contents, "due");
-            let blocked = extract_frontmatter_value(&contents, "blocked");
-            return (due, blocked);
+            let blocked_by = parse_id_array(&extract_frontmatter_value(&contents, "blocked_by"));
+            return (due, blocked_by);
         }
     }
     (String::new(), String::new())
+}
+
+/// Turn a raw TOML string array such as `["2", "3"]` into `2,3`.
+/// Anything that isn't a string array yields an empty string.
+fn parse_id_array(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    let Ok(table) = toml::from_str::<toml::Table>(&format!("v = {raw}")) else {
+        return String::new();
+    };
+    match table.get("v") {
+        Some(toml::Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        _ => String::new(),
+    }
 }
 
 /// Extract a single value from TOML frontmatter delimited by `---`.
@@ -202,8 +222,8 @@ fn run_hook(
         .canonicalize()
         .unwrap_or_else(|_| kando_dir.parent().unwrap_or(kando_dir).to_path_buf());
 
-    // Read card due/blocked from disk (best-effort, empty string if not found)
-    let (card_due, card_blocked) = read_card_due_blocked(kando_dir, card_id);
+    // Read card due/blocked_by from disk (best-effort, empty string if not found)
+    let (card_due, card_blocked_by) = read_card_due_blocked_by(kando_dir, card_id);
 
     let start = Instant::now();
 
@@ -212,7 +232,7 @@ fn run_hook(
         .env("KANDO_CARD_ID", card_id)
         .env("KANDO_CARD_TITLE", card_title)
         .env("KANDO_CARD_DUE", &card_due)
-        .env("KANDO_CARD_BLOCKED", &card_blocked)
+        .env("KANDO_CARD_BLOCKED_BY", &card_blocked_by)
         .env("KANDO_BOARD_DIR", &project_dir)
         .envs(
             extras
@@ -1176,7 +1196,15 @@ mod tests {
         assert_eq!(extract_frontmatter_value(content, "due"), "");
     }
 
-    // ── read_card_due_blocked tests ──
+    #[test]
+    fn parse_id_array_cases() {
+        assert_eq!(parse_id_array("[\"2\", \"3\"]"), "2,3");
+        assert_eq!(parse_id_array("[]"), "");
+        assert_eq!(parse_id_array(""), "");
+        assert_eq!(parse_id_array("\"not an array\""), "");
+    }
+
+    // ── read_card_due_blocked_by tests ──
 
     #[test]
     fn read_card_due_blocked_finds_card() {
@@ -1185,11 +1213,11 @@ mod tests {
         fs::create_dir_all(&col_dir).unwrap();
         fs::write(
             col_dir.join("001.md"),
-            "---\nid = \"001\"\ntitle = \"T\"\ndue = \"2025-06-01\"\nblocked = \"waiting\"\ncreated = \"2025-01-01T00:00:00Z\"\nupdated = \"2025-01-01T00:00:00Z\"\n---\n",
+            "---\nid = \"001\"\ntitle = \"T\"\ndue = \"2025-06-01\"\nblocked_by = [\"2\", \"3\"]\nblocked = \"legacy\"\ncreated = \"2025-01-01T00:00:00Z\"\nupdated = \"2025-01-01T00:00:00Z\"\n---\n",
         ).unwrap();
-        let (due, blocked) = read_card_due_blocked(tmp.path(), "001");
+        let (due, blocked) = read_card_due_blocked_by(tmp.path(), "001");
         assert_eq!(due, "2025-06-01");
-        assert_eq!(blocked, "waiting");
+        assert_eq!(blocked, "2,3", "legacy `blocked` must not leak in");
     }
 
     #[test]
@@ -1197,7 +1225,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let col_dir = tmp.path().join("columns").join("backlog");
         fs::create_dir_all(&col_dir).unwrap();
-        let (due, blocked) = read_card_due_blocked(tmp.path(), "999");
+        let (due, blocked) = read_card_due_blocked_by(tmp.path(), "999");
         assert_eq!(due, "");
         assert_eq!(blocked, "");
     }
@@ -1205,7 +1233,7 @@ mod tests {
     #[test]
     fn read_card_due_blocked_no_columns_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let (due, blocked) = read_card_due_blocked(tmp.path(), "001");
+        let (due, blocked) = read_card_due_blocked_by(tmp.path(), "001");
         assert_eq!(due, "");
         assert_eq!(blocked, "");
     }
@@ -1219,7 +1247,7 @@ mod tests {
             col_dir.join("001.md"),
             "---\nid = \"001\"\ntitle = \"T\"\ncreated = \"2025-01-01T00:00:00Z\"\nupdated = \"2025-01-01T00:00:00Z\"\n---\n",
         ).unwrap();
-        let (due, blocked) = read_card_due_blocked(tmp.path(), "001");
+        let (due, blocked) = read_card_due_blocked_by(tmp.path(), "001");
         assert_eq!(due, "");
         assert_eq!(blocked, "");
     }
@@ -1234,7 +1262,7 @@ mod tests {
             col_dir.join("001.md"),
             "---\nid = \"001\"\ntitle = \"T\"\ndue = \"2025-06-01\"\ncreated = \"2025-01-01T00:00:00Z\"\nupdated = \"2025-01-01T00:00:00Z\"\n---\n",
         ).unwrap();
-        let (due, blocked) = read_card_due_blocked(tmp.path(), "001");
+        let (due, blocked) = read_card_due_blocked_by(tmp.path(), "001");
         assert_eq!(due, "2025-06-01");
         assert_eq!(blocked, "");
     }
@@ -1253,7 +1281,7 @@ mod tests {
         fs::create_dir_all(&col_dir).unwrap();
         fs::write(
             col_dir.join("001.md"),
-            "---\nid = \"001\"\ntitle = \"T\"\ndue = \"2025-06-15\"\nblocked = \"needs review\"\ncreated = \"2025-01-01T00:00:00Z\"\nupdated = \"2025-01-01T00:00:00Z\"\n---\n",
+            "---\nid = \"001\"\ntitle = \"T\"\ndue = \"2025-06-15\"\nblocked_by = [\"7\"]\ncreated = \"2025-01-01T00:00:00Z\"\nupdated = \"2025-01-01T00:00:00Z\"\n---\n",
         ).unwrap();
 
         // Create hook
@@ -1262,7 +1290,7 @@ mod tests {
         let hook_path = hooks_dir.join("post-create");
         fs::write(
             &hook_path,
-            "#!/usr/bin/env sh\necho \"due=$KANDO_CARD_DUE blocked=$KANDO_CARD_BLOCKED\"",
+            "#!/usr/bin/env sh\necho \"due=$KANDO_CARD_DUE blocked_by=$KANDO_CARD_BLOCKED_BY\"",
         ).unwrap();
         fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -1273,7 +1301,7 @@ mod tests {
 
         let notif = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert!(notif.message.contains("due=2025-06-15"), "msg: {}", notif.message);
-        assert!(notif.message.contains("blocked=needs review"), "msg: {}", notif.message);
+        assert!(notif.message.contains("blocked_by=7"), "msg: {}", notif.message);
         deregister_hook_sender();
     }
 

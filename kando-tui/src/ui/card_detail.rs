@@ -12,22 +12,75 @@ use super::board_view::card_border_style;
 use super::card_image::{self, ImagePane};
 use super::theme::{Icons, Theme};
 use kando_core::board::age::{format_age, staleness};
-use kando_core::board::{Card, Policies};
+use kando_core::board::{Board, Card};
 use chrono::{DateTime, Utc};
 
 /// Everything the detail pane needs, gathered into one value so the render
 /// signature stays readable.
 pub struct DetailView<'a> {
     pub card: &'a Card,
-    pub policies: &'a Policies,
+    /// The whole board, to resolve blockers and derive what this card blocks.
+    pub board: &'a Board,
     pub now: DateTime<Utc>,
     pub icons: &'a Icons,
     pub image: ImagePane<'a>,
 }
 
+/// "Blocked by" and the derived "Blocking" lines, one card per line.
+/// Resolved blockers stay listed but dimmed and struck through, so it is
+/// visible why a card stopped being blocked.
+fn blocker_lines<'a>(board: &'a Board, card: &'a Card, icons: &Icons) -> Vec<Line<'a>> {
+    const INDENT: &str = "            ";
+    let card_ref = |id: &str| -> String {
+        match board.find_card(id) {
+            Some((c, k)) => format!("#{id} {}", board.columns[c].cards[k].title),
+            None => format!("#{id} (not on board)"),
+        }
+    };
+    let mut lines = Vec::new();
+
+    for (i, id) in card.blocked_by.iter().enumerate() {
+        let label = if i == 0 { "Blocked by: " } else { INDENT };
+        let entry = if board.blocker_is_resolved(id) {
+            Span::styled(
+                card_ref(id),
+                Theme::dim_style().add_modifier(Modifier::CROSSED_OUT),
+            )
+        } else {
+            Span::styled(
+                format!("{} {}", icons.blocker, card_ref(id)),
+                Style::default().fg(Theme::BLOCKER),
+            )
+        };
+        lines.push(Line::from(vec![Span::styled(label, Theme::dim_style()), entry]));
+    }
+
+    for (i, id) in board.is_blocking(&card.id).iter().enumerate() {
+        let label = if i == 0 { "Blocking:   " } else { INDENT };
+        lines.push(Line::from(vec![
+            Span::styled(label, Theme::dim_style()),
+            Span::raw(card_ref(id)),
+        ]));
+    }
+
+    if let Some(note) = &card.legacy_blocked {
+        let note = if note.is_empty() { "(no reason)".to_string() } else { note.clone() };
+        lines.push(Line::from(vec![
+            Span::styled("Old block:  ", Theme::dim_style()),
+            Span::styled(
+                format!("{note}: re-block with card IDs"),
+                Theme::dim_style(),
+            ),
+        ]));
+    }
+
+    lines
+}
+
 pub fn render_card_detail(f: &mut Frame, area: Rect, scroll: &mut u16, view: &mut DetailView<'_>) {
     let card = view.card;
-    let policies = view.policies;
+    let board = view.board;
+    let policies = &board.policies;
     let now = view.now;
     let icons = view.icons;
 
@@ -35,7 +88,7 @@ pub fn render_card_detail(f: &mut Frame, area: Rect, scroll: &mut u16, view: &mu
 
     let stale = staleness(card, policies, now);
     let is_overdue = card.is_overdue(now.date_naive());
-    let border_style = card_border_style(card.is_blocked(), is_overdue, true, stale, false);
+    let border_style = card_border_style(board.is_blocked(card), is_overdue, true, stale, false);
 
     let title = Line::from(Span::styled(
         format!(" {} ", card.id),
@@ -77,22 +130,7 @@ pub fn render_card_detail(f: &mut Frame, area: Rect, scroll: &mut u16, view: &mu
     };
     lines.push(Line::from(priority_spans));
 
-    if let Some(reason) = &card.blocked {
-        let mut spans = vec![
-            Span::styled("Status:   ", Theme::dim_style()),
-            Span::styled(
-                format!("{} BLOCKED", icons.blocker),
-                Style::default().fg(Theme::BLOCKER),
-            ),
-        ];
-        if !reason.is_empty() {
-            spans.push(Span::styled(
-                format!(": {reason}"),
-                Style::default().fg(Theme::BLOCKER),
-            ));
-        }
-        lines.push(Line::from(spans));
-    }
+    lines.extend(blocker_lines(board, card, icons));
 
     // Due date
     if let Some(due) = card.due {
@@ -374,7 +412,34 @@ mod tests {
     fn render_body(body: &str, kando_dir: &Path) -> String {
         let mut card = kando_core::Card::new("1".into(), "Learn kanban".into());
         card.body = body.to_string();
-        let policies = Policies::default();
+        render_card_on(&card, &blocker_board(), kando_dir)
+    }
+
+    /// backlog: 2 "Write docs" · done: 3 "Set up CI"
+    fn blocker_board() -> Board {
+        let col = |slug: &str, order: u32, cards: Vec<Card>| kando_core::Column {
+            slug: slug.into(),
+            name: slug.into(),
+            order,
+            wip_limit: None,
+            hidden: false,
+            cards,
+        };
+        Board {
+            name: "Test".into(),
+            next_card_id: 10,
+            policies: kando_core::Policies::default(),
+            sync_branch: None,
+            nerd_font: false,
+            created_at: None,
+            columns: vec![
+                col("backlog", 0, vec![Card::new("2".into(), "Write docs".into())]),
+                col("done", 1, vec![Card::new("3".into(), "Set up CI".into())]),
+            ],
+        }
+    }
+
+    fn render_card_on(card: &Card, board: &Board, kando_dir: &Path) -> String {
         let icons = crate::ui::theme::icons(false);
         let now: DateTime<Utc> = "2026-01-15T12:00:00Z".parse().unwrap();
 
@@ -383,8 +448,8 @@ mod tests {
         terminal
             .draw(|f| {
                 let mut view = DetailView {
-                    card: &card,
-                    policies: &policies,
+                    card,
+                    board,
                     now,
                     icons,
                     image: pane(kando_dir, false),
@@ -438,5 +503,29 @@ mod tests {
         let screen = render_body("Just some notes.", &kando_dir);
         assert!(screen.contains("Just some notes."));
         assert!(!screen.contains("i hide"), "no image, so no image caption:\n{screen}");
+    }
+
+    #[test]
+    fn detail_lists_blockers_and_what_the_card_blocks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut board = blocker_board();
+        board.columns[0].cards[0].blocked_by = vec!["1".into()]; // 2 waits on 1
+        let mut card = Card::new("1".into(), "Learn kanban".into());
+        card.blocked_by = vec!["2".into(), "3".into()];
+        board.columns[0].cards.push(card.clone());
+
+        let screen = render_card_on(&card, &board, tmp.path());
+        assert!(screen.contains("Blocked by: X #2 Write docs"), "{screen}");
+        assert!(screen.contains("#3 Set up CI"), "resolved blocker still listed:\n{screen}");
+        assert!(screen.contains("Blocking:   #2 Write docs"), "{screen}");
+    }
+
+    #[test]
+    fn detail_shows_legacy_block_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut card = Card::new("1".into(), "Learn kanban".into());
+        card.legacy_blocked = Some("waiting for 1".into());
+        let screen = render_card_on(&card, &blocker_board(), tmp.path());
+        assert!(screen.contains("waiting for 1: re-block with card IDs"), "{screen}");
     }
 }

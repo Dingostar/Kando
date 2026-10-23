@@ -171,7 +171,7 @@ pub enum InputTarget {
     PipeCommand,
     DueDate,
     TemplateRename(String), // holds old slug
-    BlockerReason,
+    BlockedBy,
 }
 
 #[derive(Debug, Clone)]
@@ -212,7 +212,7 @@ pub enum RepeatableAction {
     SetTags(Vec<String>),
     SetAssignees(Vec<String>),
     SetDueDate(Option<chrono::NaiveDate>),
-    SetBlocked(Option<String>),
+    SetBlockedBy(Vec<String>),
     Archive,
     DeleteCard,
     PipeCommand(String),
@@ -246,8 +246,8 @@ impl RepeatableAction {
             Self::SetAssignees(a) => format!("assignees: {}", a.join(", ")),
             Self::SetDueDate(Some(d)) => format!("due: {}", d.format("%Y-%m-%d")),
             Self::SetDueDate(None) => "clear due".into(),
-            Self::SetBlocked(Some(_)) => "block".into(),
-            Self::SetBlocked(None) => "unblock".into(),
+            Self::SetBlockedBy(ids) if ids.is_empty() => "unblock".into(),
+            Self::SetBlockedBy(ids) => format!("blocked by: {}", ids.join(", ")),
             Self::Archive => "archive".into(),
             Self::DeleteCard => "delete".into(),
             Self::PipeCommand(cmd) => {
@@ -268,7 +268,7 @@ impl RepeatableAction {
     /// Risk level for status bar hint coloring.
     pub fn risk_level(&self) -> RiskLevel {
         match self {
-            Self::SetBlocked(_) | Self::SetTags(_) | Self::SetAssignees(_)
+            Self::SetBlockedBy(_) | Self::SetTags(_) | Self::SetAssignees(_)
             | Self::SetPriority(_) | Self::SetDueDate(_) | Self::SortColumn(_)
             | Self::SetWipLimit(_) | Self::ColSetHidden(_) => RiskLevel::Low,
 
@@ -1514,31 +1514,14 @@ fn handle_repeat_last(
             let label = if due.is_some() { "Set due date" } else { "Clear due date" };
             return Ok(Some(label.into()));
         }
-        RepeatableAction::SetBlocked(ref target) => {
-            let col_idx = state.focused_column;
-            let card_idx = state.selected_card;
-            if let Some(card) = board.columns.get_mut(col_idx).and_then(|c| c.cards.get_mut(card_idx)) {
-                if card.is_blocked() == target.is_some() {
-                    let msg = if target.is_some() { "Already blocked" } else { "Already unblocked" };
-                    state.notify(msg);
-                    return Ok(None);
+        RepeatableAction::SetBlockedBy(ids) => {
+            return match apply_blocked_by(board, state, ids, kando_dir)? {
+                Ok(msg) => Ok(msg),
+                Err(e) => {
+                    state.notify_error(e);
+                    Ok(None)
                 }
-                let card_id = card.id.clone();
-                let card_title = card.title.clone();
-                card.blocked = target.clone();
-                card.touch();
-                let msg = if target.is_some() { "Card blocked" } else { "Blocker removed" };
-                board.columns[col_idx].sort_cards();
-                let col_name = board.columns[col_idx].name.clone();
-                save_board(kando_dir, board)?;
-                let blocked_str = if target.is_some() { "true" } else { "false" };
-                let action_str = if target.is_some() { "Block" } else { "Unblock" };
-                append_activity(kando_dir, "blocker", &card_id, &card_title,
-                    &[("column", &col_name), ("blocked", blocked_str)]);
-                state.clamp_selection_filtered(board);
-                state.notify(msg);
-                return Ok(Some(format!("{action_str} #{card_id} \"{card_title}\"")));
-            }
+            };
         }
         RepeatableAction::Archive => {
             let archive_idx = match board.columns.iter().position(|c| c.slug == "archive") {
@@ -1599,7 +1582,7 @@ fn handle_repeat_last(
             let card_assignees = card.assignees.join(",");
             let card_priority = card.priority.to_string();
             let card_due = card.due.map(|d| d.to_string()).unwrap_or_default();
-            let card_blocked = card.blocked.clone().unwrap_or_default();
+            let card_blocked_by = card.blocked_by.join(",");
             let card_path = kando_dir.join("columns").join(&col_slug)
                 .join(format!("{card_id}.md"));
             let contents = std::fs::read_to_string(&card_path).unwrap_or_default();
@@ -1614,7 +1597,7 @@ fn handle_repeat_last(
                 .env("KANDO_CARD_PRIORITY", &card_priority)
                 .env("KANDO_CARD_COLUMN", &col_name)
                 .env("KANDO_CARD_DUE", &card_due)
-                .env("KANDO_CARD_BLOCKED", &card_blocked)
+                .env("KANDO_CARD_BLOCKED_BY", &card_blocked_by)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
@@ -2259,35 +2242,19 @@ where
             }
         }
         Action::ToggleBlocker => {
-            if was_minor_mode { state.mode = Mode::Normal; }
-            let col_idx = state.focused_column;
-            let card_idx = state.selected_card;
-            if let Some(card) = board.columns.get(col_idx).and_then(|c| c.cards.get(card_idx)) {
-                if card.is_blocked() {
-                    // Unblock directly: no prompt needed
-                    let card = board.columns[col_idx].cards.get_mut(card_idx).unwrap();
-                    let card_id = card.id.clone();
-                    let card_title = card.title.clone();
-                    card.blocked = None;
-                    card.touch();
-                    board.columns[col_idx].sort_cards();
-                    let col_name = board.columns[col_idx].name.clone();
-                    save_board(kando_dir, board)?;
-                    append_activity(kando_dir, "blocker", &card_id, &card_title,
-                        &[("column", &col_name), ("blocked", "false")]);
-                    sync_message = Some(format!("Unblock #{card_id} \"{card_title}\""));
-                    state.last_repeatable = Some(RepeatableAction::SetBlocked(None));
-                    state.clamp_selection_filtered(board);
-                    state.notify("Blocker removed");
-                } else {
-                    // Open input for blocker reason
-                    state.mode = Mode::Input {
-                        prompt: "Blocker reason (optional)",
-                        buf: TextBuffer::new(String::new()),
-                        on_confirm: InputTarget::BlockerReason,
-                        completion: None,
-                    };
-                }
+            // Always open the editor pre-filled; submitting it empty unblocks.
+            if let Some(card) = state.selected_card_ref(board) {
+                let current = card.blocked_by.join(", ");
+                state.mode = Mode::Input {
+                    prompt: "Blocked by (comma-separated card IDs)",
+                    buf: TextBuffer::new(current),
+                    on_confirm: InputTarget::BlockedBy,
+                    completion: None,
+                };
+                update_completion_hint(state, board);
+                update_ghost_text(state, board);
+            } else if was_minor_mode {
+                state.mode = Mode::Normal;
             }
         }
         Action::EditTags => {
@@ -2608,11 +2575,46 @@ fn entered_values(input: &str) -> Vec<String> {
     }
 }
 
+/// ID of the card the input modal is editing, if any.
+fn selected_card_id(state: &AppState, board: &Board) -> Option<String> {
+    board.columns
+        .get(state.focused_column)
+        .and_then(|c| c.cards.get(state.selected_card))
+        .map(|c| c.id.clone())
+}
+
+/// IDs a card can be blocked by: every unresolved card except itself, in
+/// numeric order.
+fn blocker_candidates(board: &Board, self_id: Option<&str>) -> Vec<String> {
+    let mut ids: Vec<String> = board.columns
+        .iter()
+        .flat_map(|col| &col.cards)
+        .map(|card| card.id.clone())
+        .filter(|id| Some(id.as_str()) != self_id && !board.blocker_is_resolved(id))
+        .collect();
+    sort_candidates(&InputTarget::BlockedBy, &mut ids);
+    ids
+}
+
+/// Sort completion candidates: card IDs numerically, everything else alphabetically.
+fn sort_candidates(target: &InputTarget, candidates: &mut [String]) {
+    match target {
+        InputTarget::BlockedBy => candidates.sort_by(|a, b| {
+            match (a.parse::<u64>(), b.parse::<u64>()) {
+                (Ok(x), Ok(y)) => x.cmp(&y),
+                _ => a.cmp(b),
+            }
+        }),
+        _ => candidates.sort_by_key(|c| c.to_lowercase()),
+    }
+}
+
 /// Get completion candidates for the given input target.
-fn completion_candidates(target: &InputTarget, board: &Board) -> Vec<String> {
+fn completion_candidates(target: &InputTarget, board: &Board, self_id: Option<&str>) -> Vec<String> {
     match target {
         InputTarget::EditTags => board.all_tags().into_iter().map(|(s, _)| s).collect(),
         InputTarget::EditAssignees => board.all_assignees().into_iter().map(|(s, _)| s).collect(),
+        InputTarget::BlockedBy => blocker_candidates(board, self_id),
         _ => Vec::new(),
     }
 }
@@ -2629,16 +2631,17 @@ fn filtered_candidates(all: &[String], prefix: &str, already: &[String]) -> Vec<
 
 /// Cycle tab-completion in the current input buffer.
 fn cycle_input_completion(state: &mut AppState, board: &Board, forward: bool) {
+    let self_id = selected_card_id(state, board);
     let Mode::Input { buf, on_confirm, completion, .. } = &mut state.mode else {
         return;
     };
 
-    // Only complete for tags and assignees
-    if !matches!(on_confirm, InputTarget::EditTags | InputTarget::EditAssignees) {
+    // Only complete for comma-separated list inputs
+    if !matches!(on_confirm, InputTarget::EditTags | InputTarget::EditAssignees | InputTarget::BlockedBy) {
         return;
     }
 
-    let all_candidates = completion_candidates(on_confirm, board);
+    let all_candidates = completion_candidates(on_confirm, board, self_id.as_deref());
     if all_candidates.is_empty() {
         return;
     }
@@ -2651,7 +2654,7 @@ fn cycle_input_completion(state: &mut AppState, board: &Board, forward: bool) {
         let (token, start) = current_csv_token(&buf.input);
         let already = entered_values(&buf.input);
         let mut filtered = filtered_candidates(&all_candidates, token, &already);
-        filtered.sort_by_key(|c| c.to_lowercase());
+        sort_candidates(on_confirm, &mut filtered);
         (filtered, start)
     };
 
@@ -2703,13 +2706,28 @@ fn compute_completion_hint(state: &AppState, board: &Board) -> Option<Completion
     let title = match on_confirm {
         InputTarget::EditTags => " tags ",
         InputTarget::EditAssignees => " assignees ",
+        InputTarget::BlockedBy => " blocked by ",
         _ => return None,
     };
 
-    let all_candidates = completion_candidates(on_confirm, board);
+    let self_id = selected_card_id(state, board);
+    let all_candidates = completion_candidates(on_confirm, board, self_id.as_deref());
     if all_candidates.is_empty() {
         return None;
     }
+
+    // Card IDs alone don't say much; show each with its title.
+    let label = |ids: Vec<String>| -> Vec<String> {
+        if !matches!(on_confirm, InputTarget::BlockedBy) {
+            return ids;
+        }
+        ids.into_iter()
+            .map(|id| match board.find_card(&id) {
+                Some((c, k)) => format!("{id}  {}", board.columns[c].cards[k].title),
+                None => id,
+            })
+            .collect()
+    };
 
     // While tab-cycling, show the stored candidate list instead of refiltering
     // from the buffer (which now contains the selected candidate as prefix).
@@ -2718,7 +2736,7 @@ fn compute_completion_hint(state: &AppState, board: &Board) -> Option<Completion
         if cs.index < cs.candidates.len() {
             return Some(CompletionHint {
                 title,
-                candidates: cs.candidates.clone(),
+                candidates: label(cs.candidates.clone()),
                 selected: Some(cs.index),
             });
         }
@@ -2732,9 +2750,9 @@ fn compute_completion_hint(state: &AppState, board: &Board) -> Option<Completion
         return None;
     }
 
-    candidates.sort_by_key(|c| c.to_lowercase());
+    sort_candidates(on_confirm, &mut candidates);
 
-    Some(CompletionHint { title, candidates, selected: None })
+    Some(CompletionHint { title, candidates: label(candidates), selected: None })
 }
 
 /// Compute ghost text: the suffix of the first matching candidate shown dimmed after cursor.
@@ -2743,7 +2761,7 @@ fn compute_ghost_text(state: &AppState, board: &Board) -> Option<String> {
         return None;
     };
 
-    if !matches!(on_confirm, InputTarget::EditTags | InputTarget::EditAssignees) {
+    if !matches!(on_confirm, InputTarget::EditTags | InputTarget::EditAssignees | InputTarget::BlockedBy) {
         return None;
     }
 
@@ -2757,7 +2775,8 @@ fn compute_ghost_text(state: &AppState, board: &Board) -> Option<String> {
         return None;
     }
 
-    let all_candidates = completion_candidates(on_confirm, board);
+    let self_id = selected_card_id(state, board);
+    let all_candidates = completion_candidates(on_confirm, board, self_id.as_deref());
     let (token, _) = current_csv_token(&buf.input);
 
     if token.is_empty() {
@@ -2881,6 +2900,54 @@ fn handle_input(
     Ok(sync_message)
 }
 
+/// Replace the selected card's `blocked_by` list, after validating it against
+/// the board (IDs exist, no self-reference, no cycle).
+///
+/// Returns `Ok(Ok(sync_message))` when applied (`None` if nothing changed) and
+/// `Ok(Err(reason))` when validation fails, in which case nothing is touched.
+fn apply_blocked_by(
+    board: &mut Board,
+    state: &mut AppState,
+    ids: Vec<String>,
+    kando_dir: &std::path::Path,
+) -> color_eyre::Result<Result<Option<String>, String>> {
+    let col_idx = state.focused_column;
+    let card_idx = state.selected_card;
+    let Some(card) = board.columns.get(col_idx).and_then(|c| c.cards.get(card_idx)) else {
+        return Ok(Err("No card selected".into()));
+    };
+    let card_id = card.id.clone();
+    let card_title = card.title.clone();
+    if card.blocked_by == ids && card.legacy_blocked.is_none() {
+        state.notify(if ids.is_empty() { "Already unblocked" } else { "Blockers unchanged" });
+        return Ok(Ok(None));
+    }
+    if let Err(e) = board.validate_blocked_by(&card_id, &ids) {
+        return Ok(Err(e));
+    }
+
+    let card = &mut board.columns[col_idx].cards[card_idx];
+    card.blocked_by = ids.clone();
+    card.legacy_blocked = None;
+    card.touch();
+    board.columns[col_idx].sort_cards();
+    let col_name = board.columns[col_idx].name.clone();
+    save_board(kando_dir, board)?;
+    let joined = ids.join(",");
+    append_activity(kando_dir, "blocker", &card_id, &card_title,
+        &[("column", &col_name), ("blocked_by", &joined)]);
+    state.last_repeatable = Some(RepeatableAction::SetBlockedBy(ids.clone()));
+    state.clamp_selection_filtered(board);
+    if ids.is_empty() {
+        state.notify("Blocker removed");
+        Ok(Ok(Some(format!("Unblock #{card_id} \"{card_title}\""))))
+    } else {
+        let refs = ids.iter().map(|i| format!("#{i}")).collect::<Vec<_>>().join(", ");
+        state.notify(format!("Blocked by {refs}"));
+        Ok(Ok(Some(format!("Block #{card_id} \"{card_title}\" by {refs}"))))
+    }
+}
+
 /// Process InputConfirm for Input, Filter, and Picker modes.
 fn handle_input_confirm(
     board: &mut Board,
@@ -2931,7 +2998,6 @@ fn handle_input_confirm(
                     card.priority = tmpl.priority;
                     card.tags = tmpl.tags.clone();
                     card.assignees = tmpl.assignees.clone();
-                    card.blocked = tmpl.blocked;
                     if let Some(offset) = tmpl.due_offset_days {
                         let today = chrono::Utc::now().date_naive();
                         card.due = today.checked_add_days(chrono::Days::new(offset as u64));
@@ -2965,7 +3031,6 @@ fn handle_input_confirm(
                     priority: kando_core::board::Priority::default(),
                     tags: Vec::new(),
                     assignees: Vec::new(),
-                    blocked: None,
                     due_offset_days: None,
                     body: String::new(),
                 };
@@ -3204,27 +3269,19 @@ fn handle_input_confirm(
             }
         }
         Mode::Input {
+            prompt,
             buf,
-            on_confirm: InputTarget::BlockerReason,
-            ..
+            on_confirm: InputTarget::BlockedBy,
+            completion,
         } => {
-            let reason = buf.input.trim().to_string();
-            let col_idx = state.focused_column;
-            let card_idx = state.selected_card;
-            if let Some(card) = board.columns.get_mut(col_idx).and_then(|c| c.cards.get_mut(card_idx)) {
-                let card_id = card.id.clone();
-                let card_title = card.title.clone();
-                card.blocked = Some(reason.clone());
-                card.touch();
-                board.columns[col_idx].sort_cards();
-                let col_name = board.columns[col_idx].name.clone();
-                save_board(kando_dir, board)?;
-                append_activity(kando_dir, "blocker", &card_id, &card_title,
-                    &[("column", &col_name), ("blocked", "true")]);
-                sync_message = Some(format!("Block #{card_id} \"{card_title}\""));
-                state.last_repeatable = Some(RepeatableAction::SetBlocked(Some(reason)));
-                state.clamp_selection_filtered(board);
-                state.notify("Card blocked");
+            let ids = kando_core::board::parse_card_ids(&buf.input);
+            match apply_blocked_by(board, state, ids, kando_dir)? {
+                Ok(msg) => sync_message = msg,
+                Err(e) => {
+                    // Keep the editor open so the input can be fixed.
+                    state.mode = Mode::Input { prompt, buf, on_confirm: InputTarget::BlockedBy, completion };
+                    state.notify_error(e);
+                }
             }
         }
         Mode::Input {
@@ -3243,7 +3300,7 @@ fn handle_input_confirm(
                     let card_assignees = card.assignees.join(",");
                     let card_priority = card.priority.to_string();
                     let card_due = card.due.map(|d| d.to_string()).unwrap_or_default();
-                    let card_blocked = card.blocked.clone().unwrap_or_default();
+                    let card_blocked_by = card.blocked_by.join(",");
                     let card_path = kando_dir.join("columns").join(&col_slug)
                         .join(format!("{card_id}.md"));
                     let contents = std::fs::read_to_string(&card_path).unwrap_or_default();
@@ -3258,7 +3315,7 @@ fn handle_input_confirm(
                         .env("KANDO_CARD_PRIORITY", &card_priority)
                         .env("KANDO_CARD_COLUMN", &col_name)
                         .env("KANDO_CARD_DUE", &card_due)
-                        .env("KANDO_CARD_BLOCKED", &card_blocked)
+                        .env("KANDO_CARD_BLOCKED_BY", &card_blocked_by)
                         .stdin(std::process::Stdio::piped())
                         .stdout(std::process::Stdio::piped())
                         .stderr(std::process::Stdio::piped())
@@ -4639,111 +4696,145 @@ mod tests {
         assert!(matches!(state.mode, Mode::Normal));
     }
 
-    #[test]
-    fn test_toggle_blocker_unblocked_opens_input() {
-        let (_dir, kando_dir) = setup_kando_dir();
-        let mut board = kando_core::board::storage::load_board(&kando_dir).unwrap();
-        board.columns[0].cards.push(Card::new("001".into(), "Test".into()));
-        kando_core::board::storage::save_board(&kando_dir, &board).unwrap();
-        let mut state = AppState::new();
-        let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let sync = handle_card_action(
-            &mut board, &mut state, Action::ToggleBlocker,
-            &mut terminal, &kando_dir, false,
-        ).unwrap();
-        // ToggleBlocker on an unblocked card now opens input for reason
-        assert!(sync.is_none(), "no sync message until input is confirmed");
-        assert!(!board.columns[0].cards[0].is_blocked(), "card not yet blocked, waiting for input");
-        assert!(matches!(state.mode, Mode::Input { on_confirm: InputTarget::BlockerReason, .. }));
-    }
-
-    #[test]
-    fn test_toggle_blocker_blocked_unblocks() {
-        let (_dir, kando_dir) = setup_kando_dir();
-        let mut board = kando_core::board::storage::load_board(&kando_dir).unwrap();
-        let mut card = Card::new("001".into(), "Test".into());
-        card.blocked = Some("waiting on API".into());
-        board.columns[0].cards.push(card);
-        kando_core::board::storage::save_board(&kando_dir, &board).unwrap();
-        let mut state = AppState::new();
-        let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let sync = handle_card_action(
-            &mut board, &mut state, Action::ToggleBlocker,
-            &mut terminal, &kando_dir, false,
-        ).unwrap();
-        assert_eq!(sync.as_deref(), Some("Unblock #001 \"Test\""));
-        assert!(!board.columns[0].cards[0].is_blocked());
-        assert_eq!(state.notification.as_deref(), Some("Blocker removed"));
-    }
-
-    #[test]
-    fn blocker_reason_input_confirm_sets_reason() {
-        let (_dir, kando_dir) = setup_kando_dir();
-        let mut board = kando_core::board::storage::load_board(&kando_dir).unwrap();
-        board.columns[0].cards.push(Card::new("001".into(), "Test".into()));
-        kando_core::board::storage::save_board(&kando_dir, &board).unwrap();
-        let mut state = AppState::new();
-        state.mode = Mode::Input {
-            prompt: "Blocker reason (optional)",
-            buf: TextBuffer::new("waiting on API".into()),
-            on_confirm: InputTarget::BlockerReason,
-            completion: None,
-        };
-        let sync = handle_input_confirm(&mut board, &mut state, &kando_dir).unwrap();
-        assert!(sync.is_some());
-        assert_eq!(board.columns[0].cards[0].blocked, Some("waiting on API".to_string()));
-        assert_eq!(state.notification.as_deref(), Some("Card blocked"));
-        assert!(matches!(
-            state.last_repeatable,
-            Some(RepeatableAction::SetBlocked(Some(ref r))) if r == "waiting on API"
-        ));
-    }
-
-    #[test]
-    fn blocker_reason_input_empty_sets_blocked_no_reason() {
-        let (_dir, kando_dir) = setup_kando_dir();
-        let mut board = kando_core::board::storage::load_board(&kando_dir).unwrap();
-        board.columns[0].cards.push(Card::new("001".into(), "Test".into()));
-        kando_core::board::storage::save_board(&kando_dir, &board).unwrap();
-        let mut state = AppState::new();
-        state.mode = Mode::Input {
-            prompt: "Blocker reason (optional)",
-            buf: TextBuffer::new(String::new()),
-            on_confirm: InputTarget::BlockerReason,
-            completion: None,
-        };
-        let sync = handle_input_confirm(&mut board, &mut state, &kando_dir).unwrap();
-        assert!(sync.is_some());
-        assert_eq!(board.columns[0].cards[0].blocked, Some(String::new()));
-        assert_eq!(state.notification.as_deref(), Some("Card blocked"));
-    }
-
-    #[test]
-    fn blocker_reason_input_applies_to_selected_card() {
-        let (_dir, kando_dir) = setup_kando_dir();
+    /// Board on disk with cards 001, 002, 003 in the first column.
+    fn blocker_setup() -> (tempfile::TempDir, std::path::PathBuf, Board) {
+        let (dir, kando_dir) = setup_kando_dir();
         let mut board = kando_core::board::storage::load_board(&kando_dir).unwrap();
         board.columns[0].cards.push(Card::new("001".into(), "First".into()));
         board.columns[0].cards.push(Card::new("002".into(), "Second".into()));
         board.columns[0].cards.push(Card::new("003".into(), "Third".into()));
         kando_core::board::storage::save_board(&kando_dir, &board).unwrap();
+        (dir, kando_dir, board)
+    }
+
+    fn blocked_by_input(text: &str) -> Mode {
+        Mode::Input {
+            prompt: "Blocked by (comma-separated card IDs)",
+            buf: TextBuffer::new(text.into()),
+            on_confirm: InputTarget::BlockedBy,
+            completion: None,
+        }
+    }
+
+    #[test]
+    fn toggle_blocker_opens_editor_prefilled() {
+        let (_dir, kando_dir, mut board) = blocker_setup();
+        board.columns[0].cards[0].blocked_by = vec!["002".into(), "003".into()];
+        let mut state = AppState::new();
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let sync = handle_card_action(
+            &mut board, &mut state, Action::ToggleBlocker,
+            &mut terminal, &kando_dir, false,
+        ).unwrap();
+        assert!(sync.is_none(), "no sync message until input is confirmed");
+        match &state.mode {
+            Mode::Input { buf, on_confirm: InputTarget::BlockedBy, .. } => {
+                assert_eq!(buf.input, "002, 003");
+            }
+            other => panic!("expected blocked-by editor, got {other:?}"),
+        }
+        assert_eq!(board.columns[0].cards[0].blocked_by, vec!["002", "003"], "nothing changes until confirm");
+    }
+
+    #[test]
+    fn blocked_by_confirm_sets_ids() {
+        let (_dir, kando_dir, mut board) = blocker_setup();
+        let mut state = AppState::new();
+        state.mode = blocked_by_input(" 002, #003, 002 ");
+        let sync = handle_input_confirm(&mut board, &mut state, &kando_dir).unwrap();
+        assert_eq!(sync.as_deref(), Some("Block #001 \"First\" by #002, #003"));
+        let card = board.columns[0].cards.iter().find(|c| c.id == "001").unwrap();
+        assert_eq!(card.blocked_by, vec!["002", "003"]);
+        assert!(board.is_blocked(card));
+        assert_eq!(state.notification.as_deref(), Some("Blocked by #002, #003"));
+        assert_eq!(
+            state.last_repeatable,
+            Some(RepeatableAction::SetBlockedBy(vec!["002".into(), "003".into()]))
+        );
+        assert!(matches!(state.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn blocked_by_confirm_empty_unblocks() {
+        let (_dir, kando_dir, mut board) = blocker_setup();
+        board.columns[0].cards[0].blocked_by = vec!["002".into()];
+        let mut state = AppState::new();
+        state.mode = blocked_by_input("");
+        let sync = handle_input_confirm(&mut board, &mut state, &kando_dir).unwrap();
+        assert_eq!(sync.as_deref(), Some("Unblock #001 \"First\""));
+        assert!(board.columns[0].cards.iter().all(|c| c.blocked_by.is_empty()));
+        assert_eq!(state.notification.as_deref(), Some("Blocker removed"));
+    }
+
+    #[test]
+    fn blocked_by_confirm_rejects_cycle_and_keeps_editor_open() {
+        let (_dir, kando_dir, mut board) = blocker_setup();
+        board.columns[0].cards[1].blocked_by = vec!["001".into()]; // 002 waits on 001
+        let mut state = AppState::new();
+        state.mode = blocked_by_input("002");
+        let sync = handle_input_confirm(&mut board, &mut state, &kando_dir).unwrap();
+        assert!(sync.is_none());
+        assert!(board.columns[0].cards[0].blocked_by.is_empty(), "rejected input changes nothing");
+        assert_eq!(state.notification.as_deref(), Some("Cycle: 001 -> 002 -> 001"));
+        match &state.mode {
+            Mode::Input { buf, on_confirm: InputTarget::BlockedBy, .. } => assert_eq!(buf.input, "002"),
+            other => panic!("editor should stay open, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blocked_by_confirm_rejects_self_and_unknown() {
+        let (_dir, kando_dir, mut board) = blocker_setup();
+        let mut state = AppState::new();
+        state.mode = blocked_by_input("001");
+        handle_input_confirm(&mut board, &mut state, &kando_dir).unwrap();
+        assert_eq!(state.notification.as_deref(), Some("A card cannot block itself"));
+        state.mode = blocked_by_input("999");
+        handle_input_confirm(&mut board, &mut state, &kando_dir).unwrap();
+        assert_eq!(state.notification.as_deref(), Some("No card with ID 999"));
+        assert!(board.columns[0].cards[0].blocked_by.is_empty());
+    }
+
+    #[test]
+    fn blocked_by_applies_to_selected_card() {
+        let (_dir, kando_dir, mut board) = blocker_setup();
         let mut state = AppState::new();
         state.selected_card = 1; // Select the second card
-        state.mode = Mode::Input {
-            prompt: "Blocker reason (optional)",
-            buf: TextBuffer::new("blocked for testing".into()),
-            on_confirm: InputTarget::BlockerReason,
-            completion: None,
-        };
+        state.mode = blocked_by_input("003");
         handle_input_confirm(&mut board, &mut state, &kando_dir).unwrap();
         let cards = &board.columns[0].cards;
-        let card_002 = cards.iter().find(|c| c.id == "002").unwrap();
-        let card_001 = cards.iter().find(|c| c.id == "001").unwrap();
-        let card_003 = cards.iter().find(|c| c.id == "003").unwrap();
-        assert_eq!(card_002.blocked, Some("blocked for testing".to_string()));
-        assert!(!card_001.is_blocked(), "first card unaffected");
-        assert!(!card_003.is_blocked(), "third card unaffected");
+        let blocked_by = |id: &str| cards.iter().find(|c| c.id == id).unwrap().blocked_by.clone();
+        assert_eq!(blocked_by("002"), vec!["003"]);
+        assert!(blocked_by("001").is_empty(), "first card unaffected");
+        assert!(blocked_by("003").is_empty(), "third card unaffected");
+    }
+
+    #[test]
+    fn blocked_by_completion_offers_other_unresolved_cards() {
+        let (_dir, _kando_dir, mut board) = blocker_setup();
+        // A done card is already resolved, so it isn't worth offering.
+        let done = board.columns.iter().position(|c| c.slug == "done").unwrap();
+        board.columns[done].cards.push(Card::new("010".into(), "Finished".into()));
+        let candidates = completion_candidates(&InputTarget::BlockedBy, &board, Some("001"));
+        assert_eq!(candidates, vec!["002", "003"]);
+    }
+
+    #[test]
+    fn blocked_by_candidates_sort_numerically() {
+        let mut ids = vec!["10".to_string(), "2".into(), "1".into()];
+        sort_candidates(&InputTarget::BlockedBy, &mut ids);
+        assert_eq!(ids, vec!["1", "2", "10"]);
+    }
+
+    #[test]
+    fn blocked_by_completion_hint_shows_titles() {
+        let (_dir, _kando_dir, board) = blocker_setup();
+        let mut state = AppState::new();
+        state.mode = blocked_by_input("");
+        let hint = compute_completion_hint(&state, &board).unwrap();
+        assert_eq!(hint.title, " blocked by ");
+        assert_eq!(hint.candidates, vec!["002  Second", "003  Third"]);
     }
 
     // -----------------------------------------------------------------------
@@ -7590,13 +7681,16 @@ mod tests {
     }
 
     #[test]
-    fn hint_set_blocked_true() {
-        assert_eq!(RepeatableAction::SetBlocked(Some(String::new())).hint(), "block");
+    fn hint_set_blocked_by() {
+        assert_eq!(
+            RepeatableAction::SetBlockedBy(vec!["1".into(), "3".into()]).hint(),
+            "blocked by: 1, 3"
+        );
     }
 
     #[test]
-    fn hint_set_blocked_false() {
-        assert_eq!(RepeatableAction::SetBlocked(None).hint(), "unblock");
+    fn hint_set_blocked_by_empty() {
+        assert_eq!(RepeatableAction::SetBlockedBy(vec![]).hint(), "unblock");
     }
 
     #[test]
@@ -7707,75 +7801,61 @@ mod tests {
     }
 
     #[test]
-    fn repeat_block_card() {
-        let (_dir, kando_dir) = setup_kando_dir();
-        let mut board = kando_core::board::storage::load_board(&kando_dir).unwrap();
-        board.columns[0].cards.push(Card::new("001".into(), "Test".into()));
-        kando_core::board::storage::save_board(&kando_dir, &board).unwrap();
+    fn repeat_blocked_by_applies_to_another_card() {
+        let (_dir, kando_dir, mut board) = blocker_setup();
         let mut state = AppState::new();
-        state.last_repeatable = Some(RepeatableAction::SetBlocked(Some(String::new())));
+        state.selected_card = 1; // 002
+        state.last_repeatable = Some(RepeatableAction::SetBlockedBy(vec!["003".into()]));
         let sync = handle_repeat_last(&mut board, &mut state, &kando_dir).unwrap();
         assert!(sync.is_some());
-        assert!(board.columns[0].cards[0].is_blocked());
-        assert_eq!(state.notification.as_deref(), Some("Card blocked"));
-    }
-
-    #[test]
-    fn repeat_block_card_with_reason() {
-        let (_dir, kando_dir) = setup_kando_dir();
-        let mut board = kando_core::board::storage::load_board(&kando_dir).unwrap();
-        board.columns[0].cards.push(Card::new("001".into(), "Test".into()));
-        kando_core::board::storage::save_board(&kando_dir, &board).unwrap();
-        let mut state = AppState::new();
-        state.last_repeatable = Some(RepeatableAction::SetBlocked(Some("waiting on API".into())));
-        let sync = handle_repeat_last(&mut board, &mut state, &kando_dir).unwrap();
-        assert!(sync.is_some());
-        assert_eq!(board.columns[0].cards[0].blocked, Some("waiting on API".to_string()));
-        assert_eq!(state.notification.as_deref(), Some("Card blocked"));
+        let card = board.columns[0].cards.iter().find(|c| c.id == "002").unwrap();
+        assert_eq!(card.blocked_by, vec!["003"]);
+        assert_eq!(state.notification.as_deref(), Some("Blocked by #003"));
     }
 
     #[test]
     fn repeat_unblock_card() {
-        let (_dir, kando_dir) = setup_kando_dir();
-        let mut board = kando_core::board::storage::load_board(&kando_dir).unwrap();
-        let mut card = Card::new("001".into(), "Test".into());
-        card.blocked = Some(String::new());
-        board.columns[0].cards.push(card);
-        kando_core::board::storage::save_board(&kando_dir, &board).unwrap();
+        let (_dir, kando_dir, mut board) = blocker_setup();
+        board.columns[0].cards[0].blocked_by = vec!["002".into()];
         let mut state = AppState::new();
-        state.last_repeatable = Some(RepeatableAction::SetBlocked(None));
+        state.last_repeatable = Some(RepeatableAction::SetBlockedBy(vec![]));
         let sync = handle_repeat_last(&mut board, &mut state, &kando_dir).unwrap();
         assert!(sync.is_some());
-        assert!(!board.columns[0].cards[0].is_blocked());
+        assert!(board.columns[0].cards.iter().all(|c| c.blocked_by.is_empty()));
         assert_eq!(state.notification.as_deref(), Some("Blocker removed"));
     }
 
     #[test]
-    fn repeat_block_already_blocked() {
-        let (_dir, kando_dir) = setup_kando_dir();
-        let mut board = kando_core::board::storage::load_board(&kando_dir).unwrap();
-        let mut card = Card::new("001".into(), "Test".into());
-        card.blocked = Some(String::new());
-        board.columns[0].cards.push(card);
-        kando_core::board::storage::save_board(&kando_dir, &board).unwrap();
+    fn repeat_blocked_by_unchanged_is_noop() {
+        let (_dir, kando_dir, mut board) = blocker_setup();
+        board.columns[0].cards[0].blocked_by = vec!["002".into()];
         let mut state = AppState::new();
-        state.last_repeatable = Some(RepeatableAction::SetBlocked(Some(String::new())));
+        state.last_repeatable = Some(RepeatableAction::SetBlockedBy(vec!["002".into()]));
         let sync = handle_repeat_last(&mut board, &mut state, &kando_dir).unwrap();
         assert!(sync.is_none());
-        assert_eq!(state.notification.as_deref(), Some("Already blocked"));
+        assert_eq!(state.notification.as_deref(), Some("Blockers unchanged"));
     }
 
     #[test]
     fn repeat_unblock_already_unblocked() {
-        let (_dir, kando_dir) = setup_kando_dir();
-        let mut board = kando_core::board::storage::load_board(&kando_dir).unwrap();
-        board.columns[0].cards.push(Card::new("001".into(), "Test".into()));
-        kando_core::board::storage::save_board(&kando_dir, &board).unwrap();
+        let (_dir, kando_dir, mut board) = blocker_setup();
         let mut state = AppState::new();
-        state.last_repeatable = Some(RepeatableAction::SetBlocked(None));
+        state.last_repeatable = Some(RepeatableAction::SetBlockedBy(vec![]));
         let sync = handle_repeat_last(&mut board, &mut state, &kando_dir).unwrap();
         assert!(sync.is_none());
         assert_eq!(state.notification.as_deref(), Some("Already unblocked"));
+    }
+
+    #[test]
+    fn repeat_blocked_by_onto_its_own_blocker_is_rejected() {
+        let (_dir, kando_dir, mut board) = blocker_setup();
+        let mut state = AppState::new();
+        state.selected_card = 2; // 003, repeating "blocked by 003" on itself
+        state.last_repeatable = Some(RepeatableAction::SetBlockedBy(vec!["003".into()]));
+        let sync = handle_repeat_last(&mut board, &mut state, &kando_dir).unwrap();
+        assert!(sync.is_none());
+        assert_eq!(state.notification.as_deref(), Some("A card cannot block itself"));
+        assert!(board.columns[0].cards.iter().all(|c| c.blocked_by.is_empty()));
     }
 
     #[test]
@@ -7998,31 +8078,10 @@ mod tests {
     }
 
     #[test]
-    fn record_toggle_blocker_unblock() {
-        // ToggleBlocker on a blocked card immediately unblocks and records the action
-        let (_dir, kando_dir) = setup_kando_dir();
-        let mut board = kando_core::board::storage::load_board(&kando_dir).unwrap();
-        let mut card = Card::new("001".into(), "Test".into());
-        card.blocked = Some(String::new());
-        board.columns[0].cards.push(card);
-        kando_core::board::storage::save_board(&kando_dir, &board).unwrap();
-        let mut state = AppState::new();
-        let backend = ratatui::backend::TestBackend::new(80, 24);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        handle_card_action(
-            &mut board, &mut state, Action::ToggleBlocker,
-            &mut terminal, &kando_dir, false,
-        ).unwrap();
-        assert_eq!(state.last_repeatable, Some(RepeatableAction::SetBlocked(None)));
-    }
-
-    #[test]
-    fn record_toggle_blocker_block_opens_input() {
-        // ToggleBlocker on an unblocked card opens input, does NOT record yet
-        let (_dir, kando_dir) = setup_kando_dir();
-        let mut board = kando_core::board::storage::load_board(&kando_dir).unwrap();
-        board.columns[0].cards.push(Card::new("001".into(), "Test".into()));
-        kando_core::board::storage::save_board(&kando_dir, &board).unwrap();
+    fn record_toggle_blocker_opens_input_without_recording() {
+        // ToggleBlocker only opens the editor; the action is recorded on confirm
+        let (_dir, kando_dir, mut board) = blocker_setup();
+        board.columns[0].cards[0].blocked_by = vec!["002".into()];
         let mut state = AppState::new();
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -8031,7 +8090,7 @@ mod tests {
             &mut terminal, &kando_dir, false,
         ).unwrap();
         assert!(state.last_repeatable.is_none(), "repeatable not set until input confirmed");
-        assert!(matches!(state.mode, Mode::Input { on_confirm: InputTarget::BlockerReason, .. }));
+        assert!(matches!(state.mode, Mode::Input { on_confirm: InputTarget::BlockedBy, .. }));
     }
 
     #[test]
@@ -8215,7 +8274,7 @@ mod tests {
     #[test]
     fn risk_level_low_variants() {
         use kando_core::board::Priority;
-        assert_eq!(RepeatableAction::SetBlocked(Some(String::new())).risk_level(), RiskLevel::Low);
+        assert_eq!(RepeatableAction::SetBlockedBy(vec![]).risk_level(), RiskLevel::Low);
         assert_eq!(RepeatableAction::SetTags(vec![]).risk_level(), RiskLevel::Low);
         assert_eq!(RepeatableAction::SetAssignees(vec![]).risk_level(), RiskLevel::Low);
         assert_eq!(RepeatableAction::SetPriority(Priority::Normal).risk_level(), RiskLevel::Low);
@@ -8262,7 +8321,7 @@ mod tests {
         assert!(!RepeatableAction::PipeCommand("echo".into()).is_column_level());
         assert!(!RepeatableAction::Archive.is_column_level());
         assert!(!RepeatableAction::MoveCard { forward: true }.is_column_level());
-        assert!(!RepeatableAction::SetBlocked(Some(String::new())).is_column_level());
+        assert!(!RepeatableAction::SetBlockedBy(vec![]).is_column_level());
     }
 
     // -----------------------------------------------------------------------
