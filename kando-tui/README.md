@@ -58,7 +58,7 @@ The interface is designed for speed. You don't need a mouse.
 - `H` / `L` - Move the selected card left or right
 - `Enter` - Open card details
 - `Tab` / `Shift+Tab` - Cycle through cards across all columns
-- `/` - Fuzzy search (supports `!neg` and `@user`)
+- `/` - Fuzzy search (supports `!neg`, `@user` and `#id`)
 - `n` / `N` - Jump to next / previous search match
 - `f` - Open filter menu
 - `s` - Sort current column
@@ -142,6 +142,9 @@ The hint is color-coded by risk: destructive actions (delete, remove column) app
 ### Searching and Filtering
 
 **Press `/` to search (fuzzy, supports !neg and @user)**
+
+Search also matches card IDs: `52` matches cards 52, 152 and 521 (but not 502),
+while `#52` matches only card 52.
 - `n` - Jump to next
 - `N` - Jump to previous
 

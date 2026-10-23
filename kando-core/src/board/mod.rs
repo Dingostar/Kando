@@ -582,6 +582,10 @@ pub fn card_is_visible(
 /// Special prefixes:
 /// - `@` is stripped so `@alice` matches the assignee `alice`
 /// - `!` negates: the card must NOT match that term in any field
+/// - `#` matches the card ID exactly (`#52` matches only card 52)
+///
+/// Without `#`, a term also matches the card ID as a plain substring
+/// (`52` matches 52, 152 and 521, but not 502).
 pub fn card_matches_filter(card: &Card, filter: &str, matcher: &SkimMatcherV2) -> bool {
     let terms: Vec<&str> = filter.split_whitespace().collect();
     if terms.is_empty() {
@@ -601,15 +605,23 @@ pub fn card_matches_filter(card: &Card, filter: &str, matcher: &SkimMatcherV2) -
             continue;
         }
 
-        let matches_any_field = matcher.fuzzy_match(&card.title, bare).is_some()
-            || card
-                .tags
-                .iter()
-                .any(|t| matcher.fuzzy_match(t, bare).is_some())
-            || card
-                .assignees
-                .iter()
-                .any(|a| matcher.fuzzy_match(a, bare).is_some());
+        let matches_any_field = if let Some(id) = bare.strip_prefix('#') {
+            if id.is_empty() {
+                continue;
+            }
+            card.id == id
+        } else {
+            card.id.contains(bare)
+                || matcher.fuzzy_match(&card.title, bare).is_some()
+                || card
+                    .tags
+                    .iter()
+                    .any(|t| matcher.fuzzy_match(t, bare).is_some())
+                || card
+                    .assignees
+                    .iter()
+                    .any(|a| matcher.fuzzy_match(a, bare).is_some())
+        };
 
         if negated && matches_any_field {
             return false;
@@ -1037,6 +1049,31 @@ mod tests {
         let matcher = SkimMatcherV2::default();
         let card = card_with_meta("Implement login", &["auth"], &["alice"]);
         assert!(!card_matches_filter(&card, "logout", &matcher));
+    }
+
+    fn card_with_id(id: &str, title: &str) -> Card {
+        Card::new(id.into(), title.into())
+    }
+
+    #[test]
+    fn filter_matches_id_substring() {
+        let matcher = SkimMatcherV2::default();
+        for id in ["52", "152", "521"] {
+            assert!(card_matches_filter(&card_with_id(id, "Fix bug"), "52", &matcher), "{id}");
+        }
+        assert!(!card_matches_filter(&card_with_id("502", "Fix bug"), "52", &matcher));
+    }
+
+    #[test]
+    fn filter_hash_matches_id_exactly() {
+        let matcher = SkimMatcherV2::default();
+        assert!(card_matches_filter(&card_with_id("52", "Fix bug"), "#52", &matcher));
+        for id in ["152", "521", "502"] {
+            assert!(!card_matches_filter(&card_with_id(id, "Fix bug"), "#52", &matcher), "{id}");
+        }
+        // `#` is ID-only: it does not fall through to the title.
+        assert!(!card_matches_filter(&card_with_id("1", "Card 52"), "#52", &matcher));
+        assert!(!card_matches_filter(&card_with_id("52", "Fix bug"), "!#52", &matcher));
     }
 
     #[test]

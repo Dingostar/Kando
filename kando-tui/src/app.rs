@@ -5906,9 +5906,9 @@ mod tests {
         let mut board = block_chain_board();
         let mut state = AppState::new();
         confirm_block_filter(&mut board, &mut state, "0002");
-        state.active_filter = Some("b".into());
+        state.active_filter = Some("#0001".into());
         assert_eq!(visible_card_indices(&board.columns[0], &state, &board), vec![1]);
-        state.active_filter = Some("e".into());
+        state.active_filter = Some("0004".into());
         assert!(visible_card_indices(&board.columns[0], &state, &board).is_empty());
         state.active_filter = None;
         assert!(state.has_active_filter(), "block filter alone counts as a filter");
