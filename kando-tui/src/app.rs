@@ -7,7 +7,7 @@ use ratatui::DefaultTerminal;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
 use kando_core::board::age::{run_auto_archive, run_auto_close};
-use kando_core::board::storage::{append_activity, load_board, load_local_config, load_trash, resolve_board, save_board, save_local_config, trash_card, restore_card, BoardContext, TrashEntry};
+use kando_core::board::storage::{append_activity, board_fingerprint, load_board, load_local_config, load_trash, resolve_board, save_board, save_board_merged, save_local_config, trash_card, restore_card, BoardContext, StorageError, TrashEntry};
 use kando_core::config::LocalConfig;
 use kando_core::board::sync::{self, SyncState};
 use kando_core::board::{Board, Card, Column};
@@ -344,6 +344,11 @@ pub struct AppState {
     pub notification_is_hook: bool,
     /// Board reload deferred because a hook completed while not in Normal mode.
     pub pending_hook_reload: bool,
+    /// The board as it was last loaded from or saved to disk. Saves diff the
+    /// in-memory board against this to find what the user changed, and merge
+    /// only that into the files on disk (see `save_board_merged`). `None`
+    /// falls back to a plain overwrite.
+    pub synced: Option<Board>,
     /// Terminal graphics support plus the decoded card image, if the terminal
     /// answered our capability query. `None` means no image rendering.
     pub images: Option<crate::ui::card_image::CardImages>,
@@ -388,6 +393,7 @@ impl AppState {
             hook_rx: None,
             notification_is_hook: false,
             pending_hook_reload: false,
+            synced: None,
             images: None,
             detail_image: 0,
             detail_image_collapsed: false,
@@ -425,6 +431,24 @@ impl AppState {
         self.notification_level = NotificationLevel::Error;
         self.notification_expires = Some(Instant::now() + Duration::from_secs(3));
         self.notification_is_hook = false;
+    }
+
+    /// Save the user's changes to `board` without clobbering edits made on
+    /// disk since the last load (by an agent, the CLI, or another kando).
+    pub fn save_board(&mut self, kando_dir: &std::path::Path, board: &mut Board) -> Result<(), StorageError> {
+        match &self.synced {
+            Some(base) => save_board_merged(kando_dir, base, board)?,
+            None => save_board(kando_dir, board)?,
+        }
+        self.synced = Some(board.clone());
+        Ok(())
+    }
+
+    /// Replace `board` with what is on disk now.
+    pub fn reload_board(&mut self, kando_dir: &std::path::Path, board: &mut Board) -> Result<(), StorageError> {
+        *board = load_board(kando_dir)?;
+        self.synced = Some(board.clone());
+        Ok(())
     }
 
     /// Clear expired notifications.
@@ -700,7 +724,7 @@ fn handle_auto_close(
 
     let closed = run_auto_close(board, now);
     if !closed.is_empty() {
-        save_board(kando_dir, board)?;
+        state.save_board(kando_dir, board)?;
         let target_name = board.columns.iter()
             .find(|c| c.slug == board.policies.auto_close_target)
             .map(|c| c.name.clone())
@@ -728,7 +752,7 @@ fn handle_auto_close(
     // Auto-archive completed cards from the done column
     let aa = run_auto_archive(board, now);
     if !aa.is_empty() {
-        save_board(kando_dir, board)?;
+        state.save_board(kando_dir, board)?;
         let archive_name = board.columns.iter()
             .find(|c| c.slug == "archive")
             .map(|c| c.name.clone())
@@ -824,7 +848,7 @@ fn try_reorder_card(
         return Ok(None);
     }
     state.selected_card = to;
-    save_board(kando_dir, board)?;
+    state.save_board(kando_dir, board)?;
     append_activity(kando_dir, "reorder", &card_id, &card_title,
         &[("column", &col_name), ("to", &to.to_string())]);
     state.notify(if up { "Card moved up" } else { "Card moved down" });
@@ -887,12 +911,64 @@ fn try_move_card(
     board.columns[to].sort_cards();
     state.focused_column = to;
     state.select_moved_card(board, &card_id);
-    save_board(kando_dir, board)?;
+    state.save_board(kando_dir, board)?;
     append_activity(kando_dir, "move", &card_id, &card_title,
         &[("from", &from_name), ("to", &to_name)]);
     start_jj_change(board, state, &card_id);
     state.notify("Card moved");
     Ok(Some(format!("Move card #{card_id} \"{card_title}\" from {from_name} to {to_name}")))
+}
+
+/// Replace `board` with what is on disk, keeping the selection on the same
+/// card. Returns false, leaving `board` alone, when a reload now would pull the
+/// rug out from under the open mode; the caller retries later.
+///
+/// Normal mode always reloads. Other modes act on the selected card or on
+/// column positions, so they only reload when both survive: the selected card
+/// is still in the focused column and the columns are unchanged. A pending
+/// WIP-limit move holds raw indices and always waits. Edits that land while a
+/// reload is deferred are still safe, because saves merge into disk.
+fn refresh_from_disk(board: &mut Board, state: &mut AppState, kando_dir: &std::path::Path) -> bool {
+    let Ok(fresh) = load_board(kando_dir) else {
+        return false;
+    };
+    let selected = board
+        .columns
+        .get(state.focused_column)
+        .and_then(|col| col.cards.get(state.selected_card))
+        .map(|card| card.id.clone());
+
+    if !matches!(state.mode, Mode::Normal) {
+        let waits = matches!(
+            state.mode,
+            Mode::Confirm { on_confirm: ConfirmTarget::WipLimitMove { .. }, .. }
+        );
+        let same_columns = fresh.columns.len() == board.columns.len()
+            && fresh.columns.iter().zip(&board.columns).all(|(a, b)| a.slug == b.slug);
+        let selection_kept = selected.as_ref().is_none_or(|id| {
+            fresh.columns[state.focused_column].cards.iter().any(|c| &c.id == id)
+        });
+        if waits || !same_columns || !selection_kept {
+            return false;
+        }
+    }
+
+    *board = fresh;
+    state.synced = Some(board.clone());
+    state.focused_column = state.focused_column.min(board.columns.len().saturating_sub(1));
+    let in_focused = |id: &str| {
+        board.columns[state.focused_column].cards.iter().position(|c| c.id == id)
+    };
+    match selected {
+        // An open mode is about to act on this card, so stay on it even if
+        // the edit means the active filter would now hide it.
+        Some(id) if !matches!(state.mode, Mode::Normal) => {
+            state.selected_card = in_focused(&id).expect("checked above");
+        }
+        Some(id) => state.select_moved_card(board, &id),
+        None => state.clamp_selection_filtered(board),
+    }
+    true
 }
 
 /// Main TUI application loop.
@@ -920,6 +996,7 @@ pub fn run(terminal: &mut DefaultTerminal, start_dir: &std::path::Path, nerd_fon
 
     let mut board = load_board(kando_dir)?;
     let mut state = AppState::new();
+    state.synced = Some(board.clone());
 
     // A broken keymap must not stop a board from opening: fall back to the
     // defaults and tell the user which line to fix.
@@ -970,7 +1047,7 @@ pub fn run(terminal: &mut DefaultTerminal, start_dir: &std::path::Path, nerd_fon
                 Ok(mut sync_state) => {
                     let status = sync::pull(&mut sync_state, kando_dir);
                     if status == sync::SyncStatus::Updated {
-                        board = load_board(kando_dir)?;
+                        state.reload_board(kando_dir, &mut board)?;
                         state.notify("Synced from remote");
                     }
                     state.sync_state = Some(sync_state);
@@ -1004,6 +1081,9 @@ pub fn run(terminal: &mut DefaultTerminal, start_dir: &std::path::Path, nerd_fon
     let auto_close_interval = Duration::from_secs(60);
     let mut last_sync = Instant::now();
     let sync_interval = Duration::from_secs(30);
+    let mut disk_fingerprint = board_fingerprint(kando_dir);
+    let mut last_disk_check = Instant::now();
+    let disk_check_interval = Duration::from_secs(1);
 
     loop {
         // Tick
@@ -1011,11 +1091,21 @@ pub fn run(terminal: &mut DefaultTerminal, start_dir: &std::path::Path, nerd_fon
 
         // Perform deferred hook reload once we return to Normal mode.
         if state.pending_hook_reload && matches!(state.mode, Mode::Normal) {
-            if let Ok(new_board) = load_board(kando_dir) {
-                board = new_board;
+            if state.reload_board(kando_dir, &mut board).is_ok() {
                 state.clamp_selection_filtered(&board);
             }
             state.pending_hook_reload = false;
+        }
+
+        // Pick up edits other processes made to the board files (an agent
+        // writing a plan, the CLI renaming a card), so the board, the detail
+        // view and filters stay live. A deferred refresh is retried next tick.
+        if last_disk_check.elapsed() >= disk_check_interval {
+            let fingerprint = board_fingerprint(kando_dir);
+            if fingerprint != disk_fingerprint && refresh_from_disk(&mut board, &mut state, kando_dir) {
+                disk_fingerprint = fingerprint;
+            }
+            last_disk_check = Instant::now();
         }
 
         // Drain hook results (only when no active notification)
@@ -1024,8 +1114,7 @@ pub fn run(terminal: &mut DefaultTerminal, start_dir: &std::path::Path, nerd_fon
                 if let Ok(notif) = rx.try_recv() {
                     // Reload board in case the hook modified card files on disk.
                     if matches!(state.mode, Mode::Normal) {
-                        if let Ok(new_board) = load_board(kando_dir) {
-                            board = new_board;
+                        if state.reload_board(kando_dir, &mut board).is_ok() {
                             state.clamp_selection_filtered(&board);
                         }
                     } else {
@@ -1051,12 +1140,11 @@ pub fn run(terminal: &mut DefaultTerminal, start_dir: &std::path::Path, nerd_fon
         if last_sync.elapsed() >= sync_interval {
             if let Some(ref mut sync_state) = state.sync_state {
                 let status = ctx.sync_pull(sync_state);
-                if status == sync::SyncStatus::Updated {
-                    if let Ok(new_board) = load_board(kando_dir) {
-                        board = new_board;
-                        state.clamp_selection(&board);
-                        state.notify("Synced from remote");
-                    }
+                if status == sync::SyncStatus::Updated
+                    && state.reload_board(kando_dir, &mut board).is_ok()
+                {
+                    state.clamp_selection(&board);
+                    state.notify("Synced from remote");
                 }
             }
             last_sync = Instant::now();
@@ -1282,7 +1370,7 @@ fn process_action(
             }
             state.focused_column = board.columns.iter().position(|c| c.slug == slug).unwrap_or(0);
             state.clamp_selection(board);
-            save_board(kando_dir, board)?;
+            state.save_board(kando_dir, board)?;
             let new_pos = target_idx + 1;
             append_activity(kando_dir, "col-move", &slug, &name, &[("to", &new_pos.to_string())]);
             state.notify(format!("Moved {name} to position {new_pos}"));
@@ -1356,7 +1444,7 @@ fn process_action(
         // Board-level actions
         Action::ReloadBoard => {
             state.mode = Mode::Normal;
-            *board = load_board(kando_dir)?;
+            state.reload_board(kando_dir, board)?;
             state.clamp_selection_filtered(board);
             state.notify("Board reloaded");
         }
@@ -1476,7 +1564,7 @@ fn handle_repeat_last(
             board.columns[to].sort_cards();
             state.focused_column = to;
             state.select_moved_card(board, &card_id);
-            save_board(kando_dir, board)?;
+            state.save_board(kando_dir, board)?;
             append_activity(kando_dir, "move", &card_id, &card_title,
                 &[("from", &from_name), ("to", &to_name)]);
             start_jj_change(board, state, &card_id);
@@ -1494,7 +1582,7 @@ fn handle_repeat_last(
                 let p_str = priority.as_str().to_string();
                 board.columns[col_idx].sort_cards();
                 let col_name = board.columns[col_idx].name.clone();
-                save_board(kando_dir, board)?;
+                state.save_board(kando_dir, board)?;
                 append_activity(kando_dir, "priority", &card_id, &card_title,
                     &[("column", &col_name), ("priority", &p_str)]);
                 state.clamp_selection_filtered(board);
@@ -1512,7 +1600,7 @@ fn handle_repeat_last(
                 card.touch();
                 board.columns[col_idx].sort_cards();
                 let col_name = board.columns[col_idx].name.clone();
-                save_board(kando_dir, board)?;
+                state.save_board(kando_dir, board)?;
                 append_activity(kando_dir, "tags", &card_id, &card_title,
                     &[("column", &col_name)]);
                 state.clamp_selection_filtered(board);
@@ -1530,7 +1618,7 @@ fn handle_repeat_last(
                 card.touch();
                 board.columns[col_idx].sort_cards();
                 let col_name = board.columns[col_idx].name.clone();
-                save_board(kando_dir, board)?;
+                state.save_board(kando_dir, board)?;
                 append_activity(kando_dir, "assignees", &card_id, &card_title,
                     &[("column", &col_name)]);
                 state.clamp_selection_filtered(board);
@@ -1577,7 +1665,7 @@ fn handle_repeat_last(
             let archive_name = board.columns[archive_idx].name.clone();
             board.columns[archive_idx].cards.push(card);
             board.columns[archive_idx].sort_cards();
-            save_board(kando_dir, board)?;
+            state.save_board(kando_dir, board)?;
             append_activity(kando_dir, "archive", &id, &title,
                 &[("from", &from_col_name), ("to", &archive_name)]);
             state.clamp_selection_filtered(board);
@@ -1688,7 +1776,7 @@ fn handle_repeat_last(
                     }
                 }
                 state.clamp_selection_filtered(board);
-                save_board(kando_dir, board)?;
+                state.save_board(kando_dir, board)?;
                 state.notify(format!("Sorted by {sort_key}"));
                 return Ok(Some("Sort column".into()));
             }
@@ -1740,7 +1828,7 @@ fn handle_repeat_last(
             }
             state.focused_column = board.columns.iter().position(|c| c.slug == slug).unwrap_or(0);
             state.clamp_selection(board);
-            save_board(kando_dir, board)?;
+            state.save_board(kando_dir, board)?;
             let new_pos = target + 1;
             append_activity(kando_dir, "col-move", &slug, &name, &[("to", &new_pos.to_string())]);
             state.notify(format!("Moved {name} to position {new_pos}"));
@@ -1762,7 +1850,7 @@ fn handle_repeat_last(
             if let Some(col) = board.columns.get_mut(col_idx) {
                 col.wip_limit = limit;
                 let col_name = col.name.clone();
-                save_board(kando_dir, board)?;
+                state.save_board(kando_dir, board)?;
                 if let Some(n) = limit {
                     state.notify(format!("WIP limit: {col_name} = {n}"));
                 } else {
@@ -2129,7 +2217,7 @@ where
             let archive_name = board.columns[archive_idx].name.clone();
             board.columns[archive_idx].cards.push(card);
             board.columns[archive_idx].sort_cards();
-            save_board(kando_dir, board)?;
+            state.save_board(kando_dir, board)?;
             append_activity(kando_dir, "archive", &id, &title,
                 &[("from", &from_col_name), ("to", &archive_name)]);
             state.clamp_selection_filtered(board);
@@ -2158,7 +2246,7 @@ where
             if let Some((card_id, col_slug)) = card_info {
                 let card_path = kando_dir.join("columns").join(&col_slug).join(format!("{card_id}.md"));
 
-                save_board(kando_dir, board)?;
+                state.save_board(kando_dir, board)?;
 
                 let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
                 let editor_trimmed = editor.trim();
@@ -2187,13 +2275,13 @@ where
                 terminal.clear()?;
 
                 // Always reload, since the user may have saved before the editor exited
-                *board = load_board(kando_dir)?;
+                state.reload_board(kando_dir, board)?;
                 if let Some((col_idx, card_idx)) = board.find_card(&card_id) {
                     let card_title = board.columns[col_idx].cards[card_idx].title.clone();
                     let col_name = board.columns[col_idx].name.clone();
                     board.columns[col_idx].cards[card_idx].touch();
                     board.columns[col_idx].sort_cards();
-                    save_board(kando_dir, board)?;
+                    state.save_board(kando_dir, board)?;
                     append_activity(kando_dir, "edit", &card_id, &card_title,
                         &[("column", &col_name)]);
                     sync_message = Some(format!("Edit card #{card_id} \"{card_title}\""));
@@ -2439,7 +2527,7 @@ fn handle_col_toggle_hidden(
     let name = board.columns[col_idx].name.clone();
     let new_hidden = !currently_hidden;
     board.columns[col_idx].hidden = new_hidden;
-    save_board(kando_dir, board)?;
+    state.save_board(kando_dir, board)?;
     let action_name = if new_hidden { "col-hide" } else { "col-show" };
     append_activity(kando_dir, action_name, &slug, &name, &[]);
     state.mode = Mode::Normal;
@@ -2479,7 +2567,7 @@ fn apply_due_date(
         card.touch();
         let col_name = board.columns[col_idx].name.clone();
         board.columns[col_idx].sort_cards();
-        save_board(kando_dir, board)?;
+        state.save_board(kando_dir, board)?;
         let date_str = due.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_else(|| "none".into());
         append_activity(kando_dir, "due", &card_id, &card_title, &[("due", &date_str), ("column", &col_name)]);
         state.last_repeatable = Some(RepeatableAction::SetDueDate(due));
@@ -2969,7 +3057,7 @@ fn apply_blocked_by(
     card.touch();
     board.columns[col_idx].sort_cards();
     let col_name = board.columns[col_idx].name.clone();
-    save_board(kando_dir, board)?;
+    state.save_board(kando_dir, board)?;
     let joined = ids.join(",");
     append_activity(kando_dir, "blocker", &card_id, &card_title,
         &[("column", &col_name), ("blocked_by", &joined)]);
@@ -3011,7 +3099,7 @@ fn handle_input_confirm(
                     col.cards.push(card);
                     col.sort_cards();
                 }
-                save_board(kando_dir, board)?;
+                state.save_board(kando_dir, board)?;
                 append_activity(kando_dir, "create", &id, &title,
                     &[("column", &col_name)]);
                 sync_message = Some(format!("Create card #{id} \"{title}\" in {col_name}"));
@@ -3045,7 +3133,7 @@ fn handle_input_confirm(
                     col.cards.push(card);
                     col.sort_cards();
                 }
-                save_board(kando_dir, board)?;
+                state.save_board(kando_dir, board)?;
                 append_activity(kando_dir, "create", &id, &title,
                     &[("column", &col_name), ("template", &slug)]);
                 sync_message = Some(format!("Create card #{id} \"{title}\" in {col_name}"));
@@ -3128,7 +3216,7 @@ fn handle_input_confirm(
                 }
                 col.sort_cards();
             }
-            save_board(kando_dir, board)?;
+            state.save_board(kando_dir, board)?;
             append_activity(kando_dir, "tags", &card_id, &card_title,
                 &[("column", &col_name)]);
             sync_message = Some(format!("Update tags on #{card_id} \"{card_title}\""));
@@ -3153,7 +3241,7 @@ fn handle_input_confirm(
                 let wip_value = if limit == 0 { None } else { Some(limit) };
                 col.wip_limit = wip_value;
                 let col_name = col.name.clone();
-                save_board(kando_dir, board)?;
+                state.save_board(kando_dir, board)?;
                 state.last_repeatable = Some(RepeatableAction::SetWipLimit(wip_value));
                 if limit == 0 {
                     state.notify(format!("WIP limit removed: {col_name}"));
@@ -3205,7 +3293,7 @@ fn handle_input_confirm(
                     rename_column_dir(kando_dir, &old_slug, &new_slug).map_err(|e| {
                         color_eyre::eyre::eyre!("Could not rename column directory: {e}")
                     })?;
-                    if let Err(e) = save_board(kando_dir, board) {
+                    if let Err(e) = state.save_board(kando_dir, board) {
                         let _ = rename_column_dir(kando_dir, &new_slug, &old_slug);
                         board.columns[col_idx].slug = old_slug.clone();
                         board.columns[col_idx].name = old_name.clone();
@@ -3248,7 +3336,7 @@ fn handle_input_confirm(
                     cards: vec![],
                 });
                 normalize_column_orders(&mut board.columns);
-                save_board(kando_dir, board)?;
+                state.save_board(kando_dir, board)?;
                 append_activity(kando_dir, "col-add", &slug, &derived_name, &[]);
                 if let Some(idx) = board.columns.iter().position(|c| c.slug == slug) {
                     state.focused_column = idx;
@@ -3282,7 +3370,7 @@ fn handle_input_confirm(
                 }
                 col.sort_cards();
             }
-            save_board(kando_dir, board)?;
+            state.save_board(kando_dir, board)?;
             append_activity(kando_dir, "assignees", &card_id, &card_title,
                 &[("column", &col_name)]);
             sync_message = Some(format!("Update assignees on #{card_id} \"{card_title}\""));
@@ -3504,7 +3592,7 @@ fn handle_input_confirm(
                             let priority_str = format!("Priority: {new_priority}");
                             board.columns[col_idx].sort_cards();
                             let col_name = board.columns[col_idx].name.clone();
-                            save_board(kando_dir, board)?;
+                            state.save_board(kando_dir, board)?;
                             append_activity(kando_dir, "priority", &card_id, &card_title,
                                 &[("column", &col_name), ("priority", &new_priority)]);
                             sync_message = Some(format!("Update priority of #{card_id} \"{card_title}\" to {new_priority}"));
@@ -3538,7 +3626,7 @@ fn handle_input_confirm(
                                 _ => {}
                             }
                             state.clamp_selection_filtered(board);
-                            save_board(kando_dir, board)?;
+                            state.save_board(kando_dir, board)?;
                             state.last_repeatable = Some(RepeatableAction::SortColumn(field.clone()));
                             sync_message = Some("Sort column".into());
                         }
@@ -3664,7 +3752,7 @@ fn handle_input_confirm(
                             board.columns[to].sort_cards();
                             state.focused_column = to;
                             state.select_moved_card(board, &card_id);
-                            save_board(kando_dir, board)?;
+                            state.save_board(kando_dir, board)?;
                             append_activity(kando_dir, "move", &card_id, &card_title,
                                 &[("from", &from_name), ("to", &to_name)]);
                             start_jj_change(board, state, &card_id);
@@ -3729,7 +3817,7 @@ fn handle_undo(
         Ok(()) => {
             // last_delete was already consumed by .take() above; just clear the session flag.
             state.deleted_this_session = false;
-            *board = load_board(kando_dir)?;
+            state.reload_board(kando_dir, board)?;
             let target_col_name = board.columns[target_col].name.clone();
             append_activity(kando_dir, "restore", &entry.id, &entry.title,
                 &[("column", &target_col_name)]);
@@ -3912,7 +4000,7 @@ fn handle_confirm(
                         match trash_card(kando_dir, &col_slug, &id, &card_title) {
                             Ok(entry) => {
                                 board.columns[col_idx].cards.remove(card_idx);
-                                save_board(kando_dir, board)?;
+                                state.save_board(kando_dir, board)?;
                                 append_activity(kando_dir, "delete", &id, &card_title,
                                     &[("column", &col_name)]);
                                 sync_message = Some(format!("Delete card #{id} \"{card_title}\" from {col_name}"));
@@ -3943,7 +4031,7 @@ fn handle_confirm(
                     board.columns[to].sort_cards();
                     state.focused_column = to;
                     state.select_moved_card(board, &card_id);
-                    save_board(kando_dir, board)?;
+                    state.save_board(kando_dir, board)?;
                     append_activity(kando_dir, "move", &card_id, &card_title,
                         &[("from", &from_name), ("to", &to_name)]);
                     start_jj_change(board, state, &card_id);
@@ -3970,7 +4058,7 @@ fn handle_confirm(
                     let focused_slug = board.columns.get(state.focused_column).map(|c| c.slug.clone());
                     board.columns.remove(col_idx);
                     normalize_column_orders(&mut board.columns);
-                    save_board(kando_dir, board)?;
+                    state.save_board(kando_dir, board)?;
                     remove_column_dir(kando_dir, &slug)?;
                     append_activity(kando_dir, "col-remove", &slug, &name, &[]);
                     state.focused_column = focused_slug
@@ -4594,6 +4682,106 @@ mod tests {
         kando_core::board::storage::init_board(dir.path(), "Test", None).unwrap();
         let kando_dir = dir.path().join(".kando");
         (dir, kando_dir)
+    }
+
+    #[test]
+    fn moving_a_card_keeps_a_body_an_agent_wrote_after_the_board_loaded() {
+        use kando_core::board::storage::{load_board, save_board};
+        let (_dir, kando_dir) = setup_kando_dir();
+        let mut board = load_board(&kando_dir).unwrap();
+        let id = board.next_card_id();
+        board.columns[0].cards.push(Card::new(id, "Plan me".into()));
+        let mut state = AppState::new();
+        state.save_board(&kando_dir, &mut board).unwrap();
+
+        // An agent writes a plan into the card file behind the TUI's back.
+        let mut disk = load_board(&kando_dir).unwrap();
+        disk.columns[0].cards[0].body = "The plan".into();
+        save_board(&kando_dir, &disk).unwrap();
+
+        // The TUI, still holding the stale board, moves the card.
+        try_move_card(&mut board, &mut state, true, &kando_dir).unwrap();
+
+        let reloaded = load_board(&kando_dir).unwrap();
+        assert!(reloaded.columns[0].cards.is_empty());
+        assert_eq!(reloaded.columns[1].cards[0].body, "The plan");
+    }
+
+    /// A saved board with cards "1" and "2" in Backlog, plus a fresh state.
+    fn refresh_fixture() -> (tempfile::TempDir, std::path::PathBuf, Board, AppState) {
+        let (dir, kando_dir) = setup_kando_dir();
+        let mut board = load_board(&kando_dir).unwrap();
+        for title in ["One", "Two"] {
+            let id = board.next_card_id();
+            board.columns[0].cards.push(Card::new(id, title.into()));
+        }
+        board.columns[0].cards.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut state = AppState::new();
+        state.save_board(&kando_dir, &mut board).unwrap();
+        (dir, kando_dir, board, state)
+    }
+
+    fn edit_on_disk(kando_dir: &std::path::Path, edit: impl FnOnce(&mut Board)) {
+        let mut disk = load_board(kando_dir).unwrap();
+        edit(&mut disk);
+        save_board(kando_dir, &disk).unwrap();
+    }
+
+    fn card<'a>(board: &'a Board, id: &str) -> &'a Card {
+        let (c, i) = board.find_card(id).unwrap();
+        &board.columns[c].cards[i]
+    }
+
+    #[test]
+    fn refresh_shows_a_title_changed_on_disk_in_the_open_detail_view() {
+        let (_dir, kando_dir, mut board, mut state) = refresh_fixture();
+        state.selected_card = board.columns[0].cards.iter().position(|c| c.id == "2").unwrap();
+        state.mode = Mode::CardDetail { scroll: 0 };
+        edit_on_disk(&kando_dir, |b| {
+            let (c, i) = b.find_card("2").unwrap();
+            b.columns[c].cards[i].title = "Renamed by agent".into();
+        });
+
+        assert!(refresh_from_disk(&mut board, &mut state, &kando_dir));
+        let selected = &board.columns[0].cards[state.selected_card];
+        assert_eq!(selected.id, "2");
+        assert_eq!(selected.title, "Renamed by agent");
+    }
+
+    #[test]
+    fn refresh_brings_a_blocker_added_on_disk_into_the_block_filter() {
+        let (_dir, kando_dir, mut board, mut state) = refresh_fixture();
+        state.active_block_filter = Some("1".into());
+        assert_eq!(visible_card_indices(&board.columns[0], &state, &board).len(), 1);
+        edit_on_disk(&kando_dir, |b| {
+            let (c, i) = b.find_card("2").unwrap();
+            b.columns[c].cards[i].blocked_by = vec!["1".into()];
+        });
+
+        assert!(refresh_from_disk(&mut board, &mut state, &kando_dir));
+        assert_eq!(visible_card_indices(&board.columns[0], &state, &board).len(), 2);
+    }
+
+    #[test]
+    fn refresh_waits_while_a_prompt_targets_a_card_deleted_on_disk() {
+        let (_dir, kando_dir, mut board, mut state) = refresh_fixture();
+        state.selected_card = board.columns[0].cards.iter().position(|c| c.id == "2").unwrap();
+        state.mode = Mode::Input {
+            prompt: "Tags",
+            buf: TextBuffer::new(String::new()),
+            on_confirm: InputTarget::EditTags,
+            completion: None,
+        };
+        edit_on_disk(&kando_dir, |b| b.columns[0].cards.retain(|c| c.id != "2"));
+
+        assert!(!refresh_from_disk(&mut board, &mut state, &kando_dir));
+        assert!(board.find_card("2").is_some());
+
+        // Back in Normal mode the reload goes through.
+        state.mode = Mode::Normal;
+        assert!(refresh_from_disk(&mut board, &mut state, &kando_dir));
+        assert!(board.find_card("2").is_none());
+        assert_eq!(card(&board, "1").title, "One");
     }
 
     #[test]

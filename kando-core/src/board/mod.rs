@@ -42,7 +42,7 @@ pub struct Board {
 }
 
 /// Board-level policies for hygiene automation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Policies {
     /// Cards untouched for this many days get auto-closed. 0 = disabled.
     #[serde(default = "default_auto_close_days")]
@@ -153,7 +153,7 @@ impl std::fmt::Display for Priority {
 }
 
 /// A single kanban card (not "task" or "item").
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Card {
     pub id: String,
     pub title: String,

@@ -371,30 +371,7 @@ pub fn save_board(kando_dir: &Path, board: &Board) -> Result<(), StorageError> {
         validate_slug(&col.slug)?;
     }
 
-    // Build config
-    let column_configs: Vec<ColumnConfig> = board
-        .columns
-        .iter()
-        .map(|col| ColumnConfig {
-            slug: col.slug.clone(),
-            name: col.name.clone(),
-            order: col.order,
-            wip_limit: col.wip_limit,
-            hidden: if col.hidden { Some(true) } else { None },
-        })
-        .collect();
-
-    let config = BoardConfig {
-        board: BoardSection {
-            name: board.name.clone(),
-            next_card_id: board.next_card_id,
-            policies: board.policies.clone(),
-            sync_branch: board.sync_branch.clone(),
-            nerd_font: board.nerd_font,
-            created_at: board.created_at.map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
-        },
-        columns: column_configs,
-    };
+    let config = board_config(board);
     let config_str = toml::to_string_pretty(&config)?;
     fs::write(kando_dir.join("config.toml"), config_str)?;
 
@@ -431,6 +408,274 @@ pub fn save_board(kando_dir: &Path, board: &Board) -> Result<(), StorageError> {
     }
 
     Ok(())
+}
+
+/// Save `board` by merging it into what is on disk now, instead of
+/// overwriting it.
+///
+/// `base` is the board as it was last loaded or saved by this process. Every
+/// difference between `base` and `board` is a change the caller made; those
+/// changes are applied, field by field, onto the card files as they are on
+/// disk right now. Everything else on disk (a body an agent rewrote, a card the
+/// CLI added, a blocker set from another terminal) is left alone. When both
+/// sides changed the same field, the caller wins.
+///
+/// Unlike [`save_board`], this never deletes a card file the caller didn't
+/// know about. Only cards present in `base` and gone from `board` are removed.
+///
+/// `board` is updated in two ways so it stays consistent with disk:
+/// `next_card_id` is raised to cover IDs handed out elsewhere, and a new card
+/// whose ID was meanwhile taken on disk is given a fresh one.
+pub fn save_board_merged(kando_dir: &Path, base: &Board, board: &mut Board) -> Result<(), StorageError> {
+    use std::collections::{HashMap, HashSet};
+
+    for col in &board.columns {
+        validate_slug(&col.slug)?;
+    }
+
+    let disk_cards = read_disk_cards(kando_dir)?;
+    let disk_config: Option<BoardConfig> = fs::read_to_string(kando_dir.join("config.toml"))
+        .ok()
+        .and_then(|s| toml::from_str(&s).ok());
+
+    // Hand out fresh IDs to new cards that collide with a card created on disk
+    // since `base` was loaded.
+    let base_ids: HashSet<&str> = base
+        .columns
+        .iter()
+        .flat_map(|c| c.cards.iter().map(|card| card.id.as_str()))
+        .collect();
+    let max_disk_id = disk_cards.keys().filter_map(|id| id.parse::<u32>().ok()).max();
+    let disk_next = disk_config.as_ref().map_or(0, |c| c.board.next_card_id);
+    board.next_card_id = board
+        .next_card_id
+        .max(disk_next)
+        .max(max_disk_id.map_or(0, |n| n + 1));
+    for col in &mut board.columns {
+        for card in &mut col.cards {
+            if !base_ids.contains(card.id.as_str()) && disk_cards.contains_key(&card.id) {
+                card.id = board.next_card_id.to_string();
+                board.next_card_id += 1;
+            }
+        }
+    }
+
+    // Config: each board-level setting is taken from `board` if the caller
+    // changed it, otherwise from disk.
+    let mine_config = board_config(board);
+    let config = match disk_config {
+        None => mine_config,
+        Some(mut disk) => {
+            let base_config = board_config(base);
+            let (m, b) = (&mine_config.board, &base_config.board);
+            if m.name != b.name {
+                disk.board.name = m.name.clone();
+            }
+            if m.policies != b.policies {
+                disk.board.policies = m.policies.clone();
+            }
+            if m.sync_branch != b.sync_branch {
+                disk.board.sync_branch = m.sync_branch.clone();
+            }
+            if m.nerd_font != b.nerd_font {
+                disk.board.nerd_font = m.nerd_font;
+            }
+            if m.created_at != b.created_at {
+                disk.board.created_at = m.created_at.clone();
+            }
+            if column_layout(&mine_config.columns) != column_layout(&base_config.columns) {
+                disk.columns = mine_config.columns;
+            }
+            disk.board.next_card_id = board.next_card_id;
+            disk
+        }
+    };
+    let config_str = toml::to_string_pretty(&config)?;
+    write_if_changed(&kando_dir.join("config.toml"), &config_str)?;
+
+    // Cards: start from disk and lay the caller's changes on top.
+    let base_cards: HashMap<&str, (&str, &Card)> = base
+        .columns
+        .iter()
+        .flat_map(|col| col.cards.iter().map(move |c| (c.id.as_str(), (col.slug.as_str(), c))))
+        .collect();
+    let mut merged: HashMap<String, (String, Card)> = disk_cards
+        .iter()
+        .map(|(id, (slug, card))| (id.clone(), (slug.clone(), card.clone())))
+        .collect();
+    let mut mine_ids = HashSet::new();
+    for col in &board.columns {
+        for card in &col.cards {
+            mine_ids.insert(card.id.as_str());
+            match (base_cards.get(card.id.as_str()), disk_cards.get(&card.id)) {
+                // Edited a card that still exists on disk: merge per field.
+                (Some(&(base_slug, base_card)), Some((disk_slug, disk_card))) => {
+                    let slug = if col.slug != base_slug { &col.slug } else { disk_slug };
+                    merged.insert(
+                        card.id.clone(),
+                        (slug.clone(), merge_card(base_card, card, disk_card)),
+                    );
+                }
+                // Deleted on disk meanwhile. Keep it only if the caller has
+                // since changed it, so their edit isn't lost.
+                (Some(&(base_slug, base_card)), None) => {
+                    if card != base_card || col.slug != base_slug {
+                        merged.insert(card.id.clone(), (col.slug.clone(), card.clone()));
+                    }
+                }
+                // New card.
+                (None, _) => {
+                    merged.insert(card.id.clone(), (col.slug.clone(), card.clone()));
+                }
+            }
+        }
+    }
+    for id in base_cards.keys() {
+        if !mine_ids.contains(id) {
+            merged.remove(*id);
+        }
+    }
+
+    let columns_dir = kando_dir.join("columns");
+    for (id, (slug, card)) in &merged {
+        let col_dir = columns_dir.join(slug);
+        fs::create_dir_all(&col_dir)?;
+        write_if_changed(&col_dir.join(format!("{id}.md")), &serialize_card(card))?;
+    }
+    for (id, (disk_slug, _)) in &disk_cards {
+        let stays = merged.get(id).is_some_and(|(slug, _)| slug == disk_slug);
+        if !stays {
+            let path = columns_dir.join(disk_slug).join(format!("{id}.md"));
+            match fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// A cheap fingerprint of the board files (`config.toml` and every card),
+/// built from paths, sizes and modification times. It changes whenever
+/// something writes to the board, so a running TUI can poll it to notice edits
+/// made by other processes.
+pub fn board_fingerprint(kando_dir: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    fn add(hasher: &mut impl Hasher, path: &Path) {
+        if let Ok(meta) = fs::metadata(path) {
+            path.hash(hasher);
+            meta.len().hash(hasher);
+            meta.modified().ok().hash(hasher);
+        }
+    }
+
+    let mut paths = vec![kando_dir.join("config.toml")];
+    if let Ok(cols) = fs::read_dir(kando_dir.join("columns")) {
+        for col in cols.flatten() {
+            if let Ok(entries) = fs::read_dir(col.path()) {
+                paths.extend(entries.flatten().map(|e| e.path()));
+            }
+        }
+    }
+    paths.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for path in &paths {
+        add(&mut hasher, path);
+    }
+    hasher.finish()
+}
+
+/// Apply the fields the caller changed (`mine` vs `base`) onto `disk`.
+fn merge_card(base: &Card, mine: &Card, disk: &Card) -> Card {
+    let mut out = disk.clone();
+    macro_rules! take_changed {
+        ($($field:ident),* $(,)?) => {
+            $(if mine.$field != base.$field {
+                out.$field = mine.$field.clone();
+            })*
+        };
+    }
+    take_changed!(
+        title, created, updated, priority, order, tags, assignees, blocked_by,
+        legacy_blocked, due, started, completed, body,
+    );
+    out
+}
+
+/// Every parseable card under `columns/`, keyed by ID, with the slug of the
+/// directory it sits in. Scans all column directories, not only the ones
+/// `config.toml` lists, so a just-renamed column directory is still seen.
+fn read_disk_cards(kando_dir: &Path) -> Result<std::collections::HashMap<String, (String, Card)>, StorageError> {
+    let mut cards = std::collections::HashMap::new();
+    let columns_dir = kando_dir.join("columns");
+    if !columns_dir.exists() {
+        return Ok(cards);
+    }
+    for col_entry in fs::read_dir(&columns_dir)? {
+        let col_entry = col_entry?;
+        if !col_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let slug = col_entry.file_name().to_string_lossy().to_string();
+        for entry in fs::read_dir(col_entry.path())? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            // Only trust a card whose ID matches its file name, since that's
+            // the path we would write it back to or delete.
+            if let Ok(card) = load_card(&path) {
+                if path.file_stem().and_then(|s| s.to_str()) == Some(card.id.as_str()) {
+                    cards.entry(card.id.clone()).or_insert((slug.clone(), card));
+                }
+            }
+        }
+    }
+    Ok(cards)
+}
+
+/// The parts of a column config that a save can change.
+fn column_layout(columns: &[ColumnConfig]) -> Vec<(&str, u32, Option<u32>, Option<bool>)> {
+    columns
+        .iter()
+        .map(|c| (c.slug.as_str(), c.order, c.wip_limit, c.hidden))
+        .collect()
+}
+
+fn write_if_changed(path: &Path, content: &str) -> Result<(), StorageError> {
+    let unchanged = fs::read_to_string(path)
+        .is_ok_and(|existing| existing.replace("\r\n", "\n") == content);
+    if !unchanged {
+        fs::write(path, content)?;
+    }
+    Ok(())
+}
+
+/// The `config.toml` contents for a board.
+fn board_config(board: &Board) -> BoardConfig {
+    let columns = board
+        .columns
+        .iter()
+        .map(|col| ColumnConfig {
+            slug: col.slug.clone(),
+            name: col.name.clone(),
+            order: col.order,
+            wip_limit: col.wip_limit,
+            hidden: if col.hidden { Some(true) } else { None },
+        })
+        .collect();
+    BoardConfig {
+        board: BoardSection {
+            name: board.name.clone(),
+            next_card_id: board.next_card_id,
+            policies: board.policies.clone(),
+            sync_branch: board.sync_branch.clone(),
+            nerd_font: board.nerd_font,
+            created_at: board.created_at.map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+        },
+        columns,
+    }
 }
 
 /// Remove a column's on-disk directory (.kando/columns/{slug}/).
@@ -1124,6 +1369,126 @@ mod tests {
         assert!(!plain.contains("order"), "{plain}");
         let (fm, _) = parse_frontmatter(&plain).unwrap();
         assert_eq!(toml::from_str::<Card>(&fm).unwrap().order, None);
+    }
+
+    /// A board with one card ("1") in the first column, saved to disk.
+    fn merged_save_fixture() -> (tempfile::TempDir, PathBuf, Board) {
+        let dir = tempfile::tempdir().unwrap();
+        let kando_dir = init_board_at(&dir.path().join(".kando"), "Test", None).unwrap();
+        let mut board = load_board(&kando_dir).unwrap();
+        let mut card = Card::new(board.next_card_id(), "Original".into());
+        card.body = "Original body".into();
+        board.columns[0].cards.push(card);
+        save_board(&kando_dir, &board).unwrap();
+        (dir, kando_dir, board)
+    }
+
+    /// Edit card "1" on disk the way an agent or the CLI would.
+    fn edit_on_disk(kando_dir: &Path, edit: impl FnOnce(&mut Card)) {
+        let mut disk = load_board(kando_dir).unwrap();
+        let (c, i) = disk.find_card("1").unwrap();
+        edit(&mut disk.columns[c].cards[i]);
+        save_board(kando_dir, &disk).unwrap();
+    }
+
+    fn card_on_disk(kando_dir: &Path, id: &str) -> (String, Card) {
+        let board = load_board(kando_dir).unwrap();
+        let (c, i) = board.find_card(id).unwrap();
+        (board.columns[c].slug.clone(), board.columns[c].cards[i].clone())
+    }
+
+    #[test]
+    fn merged_save_keeps_a_body_written_on_disk_while_setting_blockers() {
+        let (_dir, kando_dir, base) = merged_save_fixture();
+        edit_on_disk(&kando_dir, |c| c.body = "Plan written by an agent".into());
+
+        let mut mine = base.clone();
+        mine.columns[0].cards[0].blocked_by = vec!["7".into()];
+        save_board_merged(&kando_dir, &base, &mut mine).unwrap();
+
+        let (_, card) = card_on_disk(&kando_dir, "1");
+        assert_eq!(card.body, "Plan written by an agent");
+        assert_eq!(card.blocked_by, vec!["7".to_string()]);
+    }
+
+    #[test]
+    fn merged_save_lets_the_caller_win_a_field_both_sides_changed() {
+        let (_dir, kando_dir, base) = merged_save_fixture();
+        edit_on_disk(&kando_dir, |c| {
+            c.title = "Disk title".into();
+            c.blocked_by = vec!["5".into()];
+        });
+
+        let mut mine = base.clone();
+        mine.columns[0].cards[0].title = "My title".into();
+        save_board_merged(&kando_dir, &base, &mut mine).unwrap();
+
+        let (_, card) = card_on_disk(&kando_dir, "1");
+        assert_eq!(card.title, "My title");
+        // Untouched by the caller, so the disk edit stays.
+        assert_eq!(card.blocked_by, vec!["5".to_string()]);
+    }
+
+    #[test]
+    fn merged_save_moves_a_card_without_losing_its_disk_edits() {
+        let (_dir, kando_dir, base) = merged_save_fixture();
+        edit_on_disk(&kando_dir, |c| c.body = "Agent body".into());
+
+        let mut mine = base.clone();
+        mine.move_card(0, 0, 1);
+        save_board_merged(&kando_dir, &base, &mut mine).unwrap();
+
+        let (slug, card) = card_on_disk(&kando_dir, "1");
+        assert_eq!(slug, base.columns[1].slug);
+        assert_eq!(card.body, "Agent body");
+        assert!(!kando_dir.join("columns").join(&base.columns[0].slug).join("1.md").exists());
+    }
+
+    #[test]
+    fn merged_save_keeps_cards_created_on_disk_and_avoids_their_ids() {
+        let (_dir, kando_dir, base) = merged_save_fixture();
+        // Someone else adds card "2" on disk.
+        let mut disk = load_board(&kando_dir).unwrap();
+        let id = disk.next_card_id();
+        disk.columns[0].cards.push(Card::new(id, "Theirs".into()));
+        save_board(&kando_dir, &disk).unwrap();
+
+        // Meanwhile the stale board also creates card "2".
+        let mut mine = base.clone();
+        let id = mine.next_card_id();
+        mine.columns[0].cards.push(Card::new(id, "Mine".into()));
+        save_board_merged(&kando_dir, &base, &mut mine).unwrap();
+
+        assert_eq!(card_on_disk(&kando_dir, "2").1.title, "Theirs");
+        assert_eq!(card_on_disk(&kando_dir, "3").1.title, "Mine");
+        assert_eq!(mine.columns[0].cards.last().unwrap().id, "3");
+        assert_eq!(mine.next_card_id, 4);
+        assert_eq!(load_board(&kando_dir).unwrap().next_card_id, 4);
+    }
+
+    #[test]
+    fn merged_save_removes_a_card_the_caller_removed() {
+        let (_dir, kando_dir, base) = merged_save_fixture();
+        let mut mine = base.clone();
+        mine.columns[0].cards.clear();
+        save_board_merged(&kando_dir, &base, &mut mine).unwrap();
+        assert!(load_board(&kando_dir).unwrap().find_card("1").is_none());
+    }
+
+    #[test]
+    fn merged_save_keeps_disk_config_changes_the_caller_did_not_make() {
+        let (_dir, kando_dir, base) = merged_save_fixture();
+        let mut disk = load_board(&kando_dir).unwrap();
+        disk.policies.stale_days = 99;
+        save_board(&kando_dir, &disk).unwrap();
+
+        let mut mine = base.clone();
+        mine.columns[1].wip_limit = Some(3);
+        save_board_merged(&kando_dir, &base, &mut mine).unwrap();
+
+        let reloaded = load_board(&kando_dir).unwrap();
+        assert_eq!(reloaded.policies.stale_days, 99);
+        assert_eq!(reloaded.columns[1].wip_limit, Some(3));
     }
 
     #[test]
