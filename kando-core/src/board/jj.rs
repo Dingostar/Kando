@@ -10,7 +10,9 @@
 //!   card files and there is no state to keep in sync with the repo.
 //! - Its parents are the changes of the card's blockers (done or not), reduced
 //!   to their heads so a blocker that already builds on another doesn't add a
-//!   redundant merge. With none, it starts from the configured base (`main`).
+//!   redundant merge. Blocker changes already in the configured base (`main`)
+//!   are left out, so new work never starts somewhere down main's history.
+//!   With none left, it starts from the base.
 //! - A card that already has a change keeps it.
 
 use std::path::{Path, PathBuf};
@@ -95,6 +97,7 @@ impl CardChangeJob {
                 None => missing.push(format!("#{blocker}")),
             }
         }
+        let parents = outside_base(repo, &self.settings.base, &parents)?;
         let revset = if parents.is_empty() {
             self.settings.base.clone()
         } else {
@@ -149,6 +152,19 @@ fn change_for(repo: &Path, card_id: &str) -> Result<Option<String>, String> {
         "-T", r#"change_id.short(12) ++ "\n""#,
     ])?;
     Ok(out.lines().next().map(str::to_string))
+}
+
+/// The `changes` that are not already in `base`'s history.
+fn outside_base(repo: &Path, base: &str, changes: &[String]) -> Result<Vec<String>, String> {
+    if changes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let revset = format!("({}) ~ ::({base})", changes.join("|"));
+    let out = jj(repo, &[
+        "log", "--no-graph", "-r", &revset,
+        "-T", r#"change_id.short(12) ++ "\n""#,
+    ])?;
+    Ok(out.lines().map(str::to_string).collect())
 }
 
 /// Card IDs go into a regex and a revset, so only allow plain ones.
@@ -339,6 +355,35 @@ mod tests {
 
         // The working copy never moved.
         assert_eq!(change_of_rev(repo, "@"), wc_before);
+    }
+
+    #[test]
+    fn blockers_already_in_main_start_from_main() {
+        if !jj_available() {
+            eprintln!("skipping: jj not installed");
+            return;
+        }
+        let dir = scratch_repo();
+        let repo = dir.path();
+
+        run(repo, "1", &[]).unwrap();
+        let c1 = change_for(repo, "1").unwrap().unwrap();
+        run(repo, "2", &[]).unwrap();
+        let c2 = change_for(repo, "2").unwrap().unwrap();
+
+        // Land 1 on main, then move main past it.
+        jj(repo, &["bookmark", "set", "--quiet", "main", "-r", &c1]).unwrap();
+        jj(repo, &["new", "--no-edit", "--quiet", "main", "-m", "later"]).unwrap();
+        let later = change_of_rev(repo, r#"description(exact:"later\n")"#);
+        jj(repo, &["bookmark", "set", "--quiet", "main", "-r", &later]).unwrap();
+
+        // Blocked only by work in main: starts from main's tip, not from 1.
+        run(repo, "3", &["1"]).unwrap();
+        assert_eq!(parents_of(repo, "3"), vec![later]);
+
+        // A blocker outside main is still built on; the one in main is dropped.
+        run(repo, "4", &["1", "2"]).unwrap();
+        assert_eq!(parents_of(repo, "4"), vec![c2]);
     }
 
     #[test]
